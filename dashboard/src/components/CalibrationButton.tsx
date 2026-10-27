@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { calibrate, getConfig } from "../api/parking";
+import { calibrate, getCameraConfig } from "../api/parking";
 
 type Phase = "idle" | "calibrating" | "done" | "error";
 
@@ -7,27 +7,29 @@ const WAIT_MS = 15000;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 interface Props {
+  /** Camera node address */
+  host: string;
   camOnline: boolean;
   /** Called after the camera confirms a new reference frame */
   onDone?: () => void;
 }
 
-export default function CalibrationButton({ camOnline, onDone }: Props) {
+export default function CalibrationButton({ host, camOnline, onDone }: Props) {
   const [phase, setPhase] = useState<Phase>("idle");
   const [error, setError] = useState("");
 
   const run = async () => {
     setPhase("calibrating");
     try {
-      const before = (await getConfig()).calib_count;
-      const res = await calibrate();
+      const before = (await getCameraConfig(host)).calib_count;
+      const res = await calibrate(host);
       if (!res.ok) throw new Error(res.error ?? "Controller rejected the request");
 
       // The camera reports an incremented calib_count once the reference is saved
       const deadline = Date.now() + WAIT_MS;
       while (Date.now() < deadline) {
         await sleep(1000);
-        const cfg = await getConfig().catch(() => null);
+        const cfg = await getCameraConfig(host).catch(() => null);
         if (cfg && cfg.calib_count !== before) {
           setPhase("done");
           onDone?.();

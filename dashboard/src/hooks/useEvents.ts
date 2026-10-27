@@ -10,19 +10,22 @@ export interface TimedEvent extends ParkingEvent {
 const MAX_EVENTS = 600;
 
 /**
- * Incrementally fetches /api/events and keeps everything seen since the page
+ * Incrementally fetches /api/events from a controller node and keeps everything seen since the page
  * opened. Controller timestamps (millis since boot) are mapped to wall time.
  */
-export function useEvents(intervalMs = 2000) {
+export function useEvents(host: string, intervalMs = 2000) {
   const [events, setEvents] = useState<TimedEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
   const lastSeq = useRef(0);
 
   useEffect(() => {
+    setEvents([]);
+    lastSeq.current = 0;
+    if (!host) return;
     let alive = true;
     const load = async () => {
       try {
-        const res = await getEvents(lastSeq.current);
+        const res = await getEvents(host, lastSeq.current);
         if (!alive) return;
         const now = Date.now();
         const mapped = res.events.map((e) => ({ ...e, at: now - (res.uptime_ms - e.t_ms) }));
@@ -45,7 +48,7 @@ export function useEvents(intervalMs = 2000) {
       alive = false;
       clearInterval(id);
     };
-  }, [intervalMs]);
+  }, [host, intervalMs]);
 
   return { events, error };
 }

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { USE_MOCK, streamUrl } from "../api/parking";
-import type { ParkingConfig, ParkingStatus, StreamMode } from "../types/parking";
+import type { CameraConfig, ParkingStatus, StreamMode } from "../types/parking";
 import MockCamera from "./MockCamera";
 import StreamImage from "./StreamImage";
 
@@ -12,7 +12,7 @@ const MODES: { id: StreamMode; label: string }[] = [
 
 interface Props {
   data: ParkingStatus;
-  config: ParkingConfig | null;
+  config: CameraConfig | null;
 }
 
 /** Camera stream with switchable detector stages and live per-bay overlays. */
@@ -20,7 +20,7 @@ export default function VisionView({ data, config }: Props) {
   const [mode, setMode] = useState<StreamMode>("raw");
   const [overlay, setOverlay] = useState(true);
   const pct = (v: number, of: number) => `${(v / of) * 100}%`;
-  const rois = config?.cam_config_received ? config.rois : [];
+  const rois = config?.rois ?? [];
   const pix = config?.pix_thresh ?? 35;
 
   const explain: Record<StreamMode, string> = {
@@ -67,7 +67,7 @@ export default function VisionView({ data, config }: Props) {
             <StreamImage
               src={streamUrl(data.cam_stream_url, mode)}
               alt="Live parking camera"
-              enabled={data.cam_online}
+              enabled={data.sources.camera}
               fallback={(failed) => (
                 <div className="flex h-full flex-col items-center justify-center gap-1.5 text-center">
                   <p className="text-[13px] font-medium text-txt-secondary">Camera offline</p>
@@ -106,7 +106,7 @@ export default function VisionView({ data, config }: Props) {
                   </div>
                 );
               })}
-              {config?.cam_config_received && (
+              {config && (
                 <div
                   className="absolute border border-dashed border-white/40"
                   style={{

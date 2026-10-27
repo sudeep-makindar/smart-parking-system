@@ -5,12 +5,13 @@ import { formatDuration } from "../utils/format";
 
 interface Props {
   data: TicketsResponse | null;
+  controllerHost: string;
 }
 
 const statePill = { entered: "pill-neutral", parked: "pill-occupied", closed: "pill-free" } as const;
 const stateLabel = { entered: "Entering", parked: "Parked", closed: "Paid" } as const;
 
-export default function TicketsTable({ data }: Props) {
+export default function TicketsTable({ data, controllerHost }: Props) {
   const revenue = data?.tickets.filter((t) => t.state === "closed").reduce((sum, t) => sum + t.fee, 0) ?? 0;
 
   return (
@@ -38,7 +39,7 @@ export default function TicketsTable({ data }: Props) {
             {data?.tickets.map((t) => (
               <tr key={t.id} className="border-t border-border transition-colors hover:bg-bg-card-hover">
                 <td className="py-2.5 pl-5 pr-3">
-                  <Link to={`/ticket/${t.id}`} target="_blank" className="font-mono text-[13px] font-semibold hover:underline">
+                  <Link to={`/ticket/${t.id}?node=${encodeURIComponent(controllerHost)}`} target="_blank" className="font-mono text-[13px] font-semibold hover:underline">
                     #{t.id}
                   </Link>
                 </td>

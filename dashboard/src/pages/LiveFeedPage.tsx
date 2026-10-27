@@ -1,5 +1,6 @@
 import VisionView from "../components/VisionView";
 import { useConfig } from "../hooks/useConfig";
+import { useNodes } from "../hooks/useNodes";
 import type { ParkingState } from "../hooks/useParking";
 import type { ParkingStatus } from "../types/parking";
 import { formatDuration } from "../utils/format";
@@ -18,7 +19,8 @@ function quality(rate: number, latency: number | null): { label: string; bars: n
 
 export default function LiveFeedPage({ data, parking }: Props) {
   const q = quality(parking.successRate, parking.latencyMs);
-  const { config } = useConfig();
+  const { camera } = useNodes();
+  const { config } = useConfig(camera?.host.trim() ?? "");
 
   return (
     <div className="grid gap-4 lg:grid-cols-[1fr_300px]">
@@ -51,9 +53,21 @@ export default function LiveFeedPage({ data, parking }: Props) {
               <dd className="num">{Math.round(parking.successRate * 100)}%</dd>
             </div>
             <div className="kv">
-              <dt>Camera last packet</dt>
-              <dd className={`num ${data.cam_online ? "" : "text-danger"}`}>
-                {data.cam_last_seen_ms >= 0 ? `${data.cam_last_seen_ms} ms ago` : "never"}
+              <dt>Camera node</dt>
+              <dd className={data.sources.camera ? "" : "text-danger"}>
+                {data.sources.camera ? `${parking.camera.latencyMs} ms · ${data.camera?.rssi} dBm` : "offline"}
+              </dd>
+            </div>
+            <div className="kv">
+              <dt>Controller node</dt>
+              <dd className={data.sources.controller ? "" : "text-danger"}>
+                {data.sources.controller ? `${parking.controller.latencyMs} ms · ${data.rssi} dBm` : "offline"}
+              </dd>
+            </div>
+            <div className="kv">
+              <dt>ESP-NOW link</dt>
+              <dd className={`num ${data.sources.controller && data.cam_last_seen_ms >= 0 && data.cam_last_seen_ms < 3000 ? "" : "text-danger"}`}>
+                {data.sources.controller && data.cam_last_seen_ms >= 0 ? `${data.cam_last_seen_ms} ms ago` : "—"}
               </dd>
             </div>
             <div className="kv">

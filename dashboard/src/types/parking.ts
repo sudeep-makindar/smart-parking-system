@@ -1,4 +1,4 @@
-// Shapes of the JSON served by the ESP32-S3 (firmware/esp32s3/esp32s3.ino).
+// Shapes of the JSON served by the nodes (firmware/esp32cam and firmware/esp32).
 
 export interface SlotStatus {
   id: string;
@@ -11,30 +11,85 @@ export interface SlotStatus {
   occupied_for_s: number;
 }
 
-export interface ParkingStatus {
+export type GateMode = "auto" | "open" | "closed";
+export type NodeKind = "camera" | "controller";
+
+/** A device the dashboard talks to, configured in Settings > Nodes. */
+export interface NodeConfig {
+  id: string;
+  name: string;
+  kind: NodeKind;
+  /** IP or hostname, e.g. "192.168.43.12" or "parking-cam.local" */
+  host: string;
+}
+
+/** GET /api/status on a camera node (ESP32-CAM). */
+export interface CameraStatus {
+  node: "camera";
+  name: string;
+  firmware: string;
+  zone: string;
+  /** 1 = occupied, 0 = free, one entry per slot */
+  slots: number[];
+  scores: number[];
+  seq: number;
+  uptime_s: number;
+  calibrated: boolean;
+  calibrating: boolean;
+  calib_count: number;
+  ip: string;
+  rssi: number;
+  stream_port: number;
+}
+
+/** GET /api/status on a controller node (ESP32). */
+export interface ControllerStatus {
+  node: "controller";
+  name: string;
+  firmware: string;
+  ip: string;
+  rssi: number;
   zone: string;
   slots: SlotStatus[];
+  leds: { slots: boolean[]; pass: boolean; stop: boolean };
   free_count: number;
   total_slots: number;
-  gate_open: boolean;
-  cam_online: boolean;
-  uptime_s: number;
   guidance: string;
-  cam_stream_url: string;
+  /** Controller still receives ESP-NOW packets from the camera */
+  cam_online: boolean;
+  /** Milliseconds since the last ESP-NOW packet from the camera, -1 if never */
+  cam_last_seen_ms: number;
+  gate_open: boolean;
+  gate_mode: GateMode;
+  servo_angle: number;
   /** IR sensor currently sees a car at the entry */
   ir_active: boolean;
-  /** Number of times the gate opened this session */
+  buzzer_on: boolean;
+  uptime_s: number;
+  /** Cars let in this session */
   cars_entered: number;
-  /** Seconds since the last gate opening, -1 if none yet */
+  /** Cars refused (lot full or gate closed) */
+  cars_denied: number;
+  /** Seconds since the last car entered, -1 if none yet */
   last_entry_ago_s: number;
   /** Controller clock was set from a browser via POST /api/time */
   time_synced: boolean;
-  /** Milliseconds since the last ESP-NOW packet from the camera, -1 if never */
-  cam_last_seen_ms: number;
   /** Sequence number of the newest event in /api/events */
   event_seq: number;
   /** Most recent ticket issued at the gate */
   last_ticket: LastTicket | null;
+}
+
+/**
+ * What the pages render: the controller's state with the slot array taken
+ * directly from the camera node when it is reachable.
+ */
+export interface ParkingStatus extends ControllerStatus {
+  /** MJPEG URL of the primary camera node, "" if none */
+  cam_stream_url: string;
+  camera: CameraStatus | null;
+  /** Which nodes answered the last poll */
+  sources: { camera: boolean; controller: boolean };
 }
 
 export interface LastTicket {
@@ -63,18 +118,14 @@ export interface Roi {
   h: number;
 }
 
-export interface ParkingConfig {
-  firmware_version: string;
-  ap_ssid: string;
-  ap_password: string;
-  ap_ip: string;
-  ap_channel: number;
-  ap_clients: number;
-  cam_stream_url: string;
+/** GET /api/config on a camera node. */
+export interface CameraConfig {
+  node: "camera";
+  firmware: string;
   zone: string;
   total_slots: number;
-  /** false until the camera has sent its first config packet */
-  cam_config_received: boolean;
+  frame_w: number;
+  frame_h: number;
   pix_thresh: number;
   t_high: number;
   t_low: number;
@@ -83,9 +134,6 @@ export interface ParkingConfig {
   calib_count: number;
   rois: Roi[];
   ref_patch: Roi;
-  fee_per_hour: number;
-  fee_minimum: number;
-  currency: string;
 }
 
 export interface ThresholdSettings {
@@ -109,8 +157,7 @@ export type EventType =
   | "ticket_closed"
   | "cam_online"
   | "cam_offline"
-  | "calibrated"
-  | "settings";
+  | "gate_mode";
 
 export interface ParkingEvent {
   seq: number;
@@ -118,7 +165,7 @@ export interface ParkingEvent {
   t_ms: number;
   type: EventType;
   slot: string | null;
-  /** Score for slot events, ticket id for ticket events, pixel threshold for settings */
+  /** Score for slot events, ticket id for ticket events, mode (0 auto, 1 open, 2 closed) for gate_mode, reason (0 full, 1 gate closed) for entry_denied */
   value: number;
 }
 

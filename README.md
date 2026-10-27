@@ -1,161 +1,170 @@
 # Smart Parking System
 
-An ESP32-CAM watches 4 parking bays and detects cars with background subtraction.
-It sends slot states over ESP-NOW to an ESP32-S3, which drives LEDs, an OLED, and an
-entry gate. The S3 also hosts a Wi-Fi network that serves a React dashboard.
+A camera-based parking monitor built on two ESP32 boards and a web dashboard.
 
-```
-ESP32-CAM ──ESP-NOW──► ESP32-S3 ──Wi-Fi AP "SmartParking"──► phone / laptop browser
-(detect + MJPEG :81)   (LEDs, OLED, gate, HTTP API + dashboard)   http://192.168.4.1
+An **ESP32-CAM** watches four parking slots and works out which are free *on the board itself*.
+It sends the result to an **ESP32 controller** over ESP-NOW, which runs the entry gate, buzzer
+and OLED. A **React dashboard** on any laptop or phone shows the live video, the slots, the
+gate, tickets and history.
+
+There is no cloud, no Python and no internet required: the camera creates its own Wi-Fi.
+
+```mermaid
+flowchart LR
+    subgraph CAM["Camera node · ESP32-CAM"]
+        D["Occupancy detection<br/>4 slots, ~2 Hz"]
+        S["MJPEG stream :81"]
+        A1["JSON API :80"]
+    end
+    subgraph CTRL["Controller node · ESP32"]
+        G["Servo gate + IR sensor"]
+        B["Buzzer · OLED · LEDs"]
+        A2["JSON API :80"]
+    end
+    UI["Web dashboard<br/>(laptop / phone)"]
+
+    D -- "ESP-NOW · [1,0,1,0]" --> CTRL
+    S -- "live video" --> UI
+    A1 -- "slots + scores" --> UI
+    A2 -- "gate · tickets · events" --> UI
+    UI -- "Open / Close / Auto" --> A2
 ```
 
-There is no Python and no serial bridge. The browser polls `GET /api/status` every 1.5 s
-and shows the camera stream from `http://192.168.4.2:81/stream`.
+All devices join the Wi-Fi network **`ParkingCam`** (password `park1234`) created by the ESP32-CAM.
 
-```
-firmware/esp32cam/esp32cam.ino   vision node (OV3660)
-firmware/esp32s3/esp32s3.ino     controller, Soft-AP, web server
-dashboard/                       Vite + React + TypeScript + Tailwind
-scripts/upload_dashboard.sh      build the dashboard and flash it to SPIFFS
-```
+## Features
 
-## 1. Try the dashboard without hardware
+- **On-device vision.** Background subtraction with Gaussian smoothing, brightness correction,
+  hysteresis and debouncing, running on the ESP32-CAM.
+- **Fast board-to-board link.** Slot states reach the controller over ESP-NOW in a few
+  milliseconds, with no router involved.
+- **Gate control.** The entry IR sensor opens the servo barrier only when a slot is free; the
+  dashboard can switch the gate between *Auto*, *Open* and *Closed*.
+- **Live dashboard.**
+  - Live video with **Raw / Difference / Mask** views of the detection pipeline
+  - Slot map, occupancy timeline and activity log
+  - Tickets with fees, and a phone ticket page opened from a QR code
+- **Any number of nodes.** Cameras and controllers are added by IP in *Settings → Nodes*.
+- **Demo mode.** A built-in simulator runs the whole dashboard without any hardware.
+
+## Repository layout
+
+| Path | What it is |
+|---|---|
+| [`firmware/esp32cam/`](firmware/esp32cam/) | Camera node: detection, video stream, Wi-Fi access point, API |
+| [`firmware/esp32/`](firmware/esp32/) | Controller node: gate, IR, buzzer, OLED, LEDs, tickets, API (classic ESP32 **or** ESP32-S3) |
+| [`firmware/cam_stream_test/`](firmware/cam_stream_test/) | Minimal camera-only stream, for checking the camera and Wi-Fi |
+| [`firmware/servo_test/`](firmware/servo_test/) | Moves the servo once, for checking the gate wiring |
+| [`dashboard/`](dashboard/) | Web dashboard (Vite, React, TypeScript, Tailwind CSS) |
+| [`docs/`](docs/) | Hardware, API, algorithm and troubleshooting guides |
+
+## Quick start
+
+### 1. Try the dashboard without hardware
+
+You need [Node.js 18+](https://nodejs.org). The same commands work on macOS, Linux, and Windows
+(Command Prompt or PowerShell).
 
 ```bash
 cd dashboard
 npm install
-npm run dev:mock        # http://localhost:5173 with a simulated parking lot
+npm run dev:mock
 ```
 
-You can also open any build with `?mock` in the URL, e.g. `http://localhost:5173/?mock`.
+Open http://localhost:5173. Everything is simulated: cars arrive, the gate opens, tickets are paid.
 
-## 2. Wiring
+### 2. Hardware
 
-**ESP32-S3**
-
-| Part | Connection |
+| Part | Notes |
 |---|---|
-| OLED SSD1306 (I2C 0x3C) | VCC→3V3, GND→GND, SDA→GPIO 8, SCL→GPIO 9 |
-| Slot LEDs | GPIO → 220 Ω → LED anode, cathode → GND |
-| A1 green / red | GPIO 1 / GPIO 2 |
-| A2 green / red | GPIO 3 / GPIO 4 |
-| A3 green / red | GPIO 5 / GPIO 6 |
-| A4 green / red | GPIO 7 / GPIO 15 |
-| SG90 servo | signal→GPIO 16, red→**5 V** supply, brown→GND |
-| IR obstacle sensor | VCC→**3V3**, GND→GND, OUT→GPIO 17 (active LOW) |
+| ESP32-CAM (AI-Thinker, OV2640 or OV3660) + ESP32-CAM-MB programmer | Powered from a 5 V 2 A power bank or charger |
+| ESP32 dev board (classic or S3) | Controller |
+| SG90 servo, IR obstacle sensor, buzzer, SSD1306 OLED (0.96″ I²C) | LEDs are optional |
 
-**ESP32-CAM (AI-Thinker)**: connect a push button between GPIO 13 and GND. The onboard
-LED on GPIO 33 is the status LED.
+Wiring tables for both controller boards are in **[docs/HARDWARE.md](docs/HARDWARE.md)**.
 
-Important:
-- Power the IR module from 3.3 V. Its output follows its supply, and the S3 pins are not 5 V tolerant.
-- Power the servo from the 5 V rail, not the S3's 3V3 pin. Connect all grounds together.
-- The ESP32-CAM needs a stable **5 V 2 A** supply. A weak USB port causes brownout resets and camera init failures.
-- If your IR module's output is HIGH when it detects a car, change `IR_ACTIVE_LEVEL` in `esp32s3.ino`.
+### 3. Flash the boards
 
-## 3. Arduino IDE setup (2.x)
-
-1. Boards Manager: install **esp32 by Espressif** (2.0.x or 3.x).
-2. Library Manager: install these libraries.
-   - **ESPAsyncWebServer** and **AsyncTCP** by *ESP32Async*. The old me-no-dev versions do not build on core 3.x.
+1. **Install the board package.** Install [Arduino IDE 2](https://www.arduino.cc/en/software). In
+   *Settings → Additional boards manager URLs*, add
+   `https://espressif.github.io/arduino-esp32/package_esp32_index.json`. Then install
+   **esp32 by Espressif Systems** from Boards Manager.
+2. **Install the libraries** with Library Manager:
    - **ArduinoJson** 7.x
-   - **Adafruit SSD1306** (installs Adafruit GFX too)
+   - **ESP Async WebServer** and **Async TCP**, both by **ESP32Async**
+   - **Adafruit SSD1306** (choose *Install all* for its dependencies)
    - **ESP32Servo**
-   - The camera, ESP-NOW, SPIFFS, and Wi-Fi libraries come with the ESP32 core.
+3. **Flash the controller** with `firmware/esp32/esp32.ino`, using the settings below. The
+   sketch picks the right pins for the selected board.
 
-| Sketch | Board | Partition scheme |
-|---|---|---|
-| `esp32s3.ino` | ESP32S3 Dev Module (USB CDC On Boot: Enabled) | Default 4MB with spiffs, or 8M with spiffs |
-| `esp32cam.ino` | AI Thinker ESP32-CAM (PSRAM enabled) | Huge APP (3MB No OTA/1MB SPIFFS) |
+   | Board | Arduino *Board* setting | Other settings |
+   |---|---|---|
+   | Classic ESP32 | **ESP32 Dev Module** | — |
+   | ESP32-S3 | **ESP32S3 Dev Module** | *USB CDC On Boot*: Enabled |
+4. **Flash the camera** with `firmware/esp32cam/esp32cam.ino`:
+   - Board: **AI Thinker ESP32-CAM**, Partition Scheme: **Huge APP**, PSRAM: **Enabled**.
+   - If the upload fails with *Wrong boot mode*, hold **IO0**, tap **RST**, release IO0, and
+     upload again.
+5. **Power up** the camera with the parking area **empty**. It creates `ParkingCam`, saves an
+   empty-lot reference, and blinks its red LED 3 times. The controller joins automatically
+   and shows its IP on the OLED.
 
-## 4. Bring-up order
+**Ports:**
 
-1. **Flash the ESP32-S3.** In the Serial Monitor (115200) you should see `AP "SmartParking" on channel 1`.
-   The LEDs run a green chase while it waits for the camera.
-2. **Upload the dashboard** to the S3 (the sketch must already be flashed):
-   ```bash
-   scripts/upload_dashboard.sh /dev/cu.usbmodem101   # your S3 port
-   ```
-   The script builds the dashboard, gzips it into `firmware/esp32s3/data/`, reads the board's
-   partition table to find SPIFFS, then flashes it with `mkspiffs` and `esptool` from the Arduino core.
-   If you run it without a port, it only stages the files and prints the steps for the
-   Arduino IDE SPIFFS-upload plugin.
-3. **Flash the ESP32-CAM** using the ESP32-CAM-MB board. With the lot **empty**, power it on.
-   - It joins the AP as `192.168.4.2`.
-   - It locks exposure after 3 s.
-   - On first boot it automatically captures the empty reference.
-   - The status LED blinks 3 times when the reference is saved.
-4. **Open the dashboard.** Join Wi-Fi `SmartParking` / `park1234` and open **http://192.168.4.1**.
-
-## 5. Tuning detection
-
-- **ROIs:** open `http://192.168.4.2:81/`. The slot rectangles and the dashed brightness-reference
-  patch are drawn on the live image. Edit `SLOT_ROIS` and `REF_PATCH` in `esp32cam.ino` until
-  each box sits inside one bay, then re-flash.
-- **Recalibrate:** empty the lot, then either press the GPIO 13 button or click
-  **Settings → Recalibrate Camera**. The camera averages 10 frames and saves them to
-  `/ref.bin` in its SPIFFS.
-- **Thresholds:** use **Settings → Detection Thresholds**. Values are stored in the camera's NVS
-  and survive reboots.
-  - Lower `pix_thresh` to catch dark cars on a dark mat.
-  - Raise `t_high` if shadows cause false "occupied".
-  - Score readouts (`Score: 72%` on each slot card) show the ratio the thresholds are compared against.
-
-## 6. HTTP API (ESP32-S3, `192.168.4.1`)
-
-| Method & path | Description |
+| OS | Serial port name |
 |---|---|
-| `GET /api/status` | Slot states, scores, `free_count`, `gate_open`, `cam_online`, `guidance`, `cam_stream_url`, … |
-| `GET /api/history` | Per-slot `total_occupied_s` and `change_count` since boot |
-| `GET /api/config` | Firmware version, AP info, current thresholds, `calib_count`, ROIs reported by the camera |
-| `POST /api/calibrate` | Relays a calibration command to the camera (`503` if the camera is offline) |
-| `POST /api/settings` | Body `{"pix_thresh":35,"t_high":0.30,"t_low":0.15}`, validated then relayed |
-| `POST /api/time` | Body `{"epoch":…}`. The dashboard sends this automatically so `since` values are real Unix times |
-| `GET /api/events?since=N` | Event log (slot changes, gate, tickets, camera, calibration) newer than sequence `N` |
-| `GET /api/tickets` | Recent parking tickets with state, bay, duration and fee |
-| `GET /api/ticket?id=1001` | One ticket, used by the phone ticket page |
+| macOS | `/dev/cu.usbserial-…` or `/dev/cu.usbmodem…` |
+| Windows | `COM3`, `COM4`, … (check Device Manager → *Ports*) |
 
-`/api/status` also returns these fields beyond the original spec: `ir_active`, `cars_entered`,
-`last_entry_ago_s`, `occupied_for_s` (per slot), `time_synced`, and `cam_last_seen_ms`.
+If no port appears, use a data USB cable and install the CP210x or CH340 driver for your board.
 
-Every response sends `Access-Control-Allow-Origin: *`, and `OPTIONS` preflights get a `204`.
-
-ESP-NOW packets:
-- Camera → controller: `parking_msg_t` (10 bytes), and `config_msg_t` (47 bytes) every 5 s.
-- Controller → camera: `command_msg_t` (6 bytes), sent 3 times and de-duplicated by `cmd_id`.
-
-## 7. Demo features
-
-- **Vision debug view** (*Live Feed*): switch the stream between **Raw**, **Difference** (`|frame − reference|`)
-  and **Mask** (pixels over the threshold), with live per-bay boxes and scores drawn over it. The camera
-  serves these at `/stream?mode=raw|diff|mask`.
-- **Parking tickets**: every gate opening issues a ticket for the suggested bay. The ticket is linked to
-  the bay the car actually takes and closed with a fee when the car leaves. The fee is ₹20/hour with a
-  ₹10 minimum; change `FEE_PER_HOUR` and `FEE_MINIMUM` in `esp32s3.ino`.
-- **Entrance sign** (`http://192.168.4.1/#/sign`): a full-screen display for a tablet at the gate.
-  It shows free spaces, the next bay, and "FULL". When a car enters it shows the bay and a QR code for
-  the ticket. Press **Enable voice** once to turn on spoken announcements.
-- **Phone ticket** (`#/ticket/<id>`): scan the QR code while connected to the SmartParking Wi-Fi to see
-  the bay, live parking time and fee.
-- **Timeline and activity** (*Analytics*): per-bay occupancy over the last 5 minutes, 15 minutes or 1 hour,
-  with gate entries and turned-away cars marked, plus a live event log and a tickets table.
-
-## 8. Developing the dashboard against real hardware
+### 4. Run the dashboard with the real hardware
 
 ```bash
 cd dashboard
-cp .env.example .env.local      # VITE_API_URL=http://192.168.4.1
-npm run dev                     # laptop must be on the SmartParking Wi-Fi
+npm install        # once, while you still have internet
+npm start          # builds and serves on http://localhost:4173
 ```
+
+1. Connect the laptop to **ParkingCam**, then open http://localhost:4173.
+2. Go to **Settings → Nodes**. The camera is `192.168.4.1`; the controller is the IP shown on
+   its OLED (usually `192.168.4.2`).
+3. Both nodes turn **● Online**.
+
+**Phones:** connect the phone to ParkingCam and open `http://<laptop-ip>:4173`. Find the laptop
+IP with `ipconfig getifaddr en0` on macOS, or `ipconfig` on Windows (*Wireless LAN adapter Wi-Fi →
+IPv4*). On Windows, allow Node.js through the firewall when asked.
+
+### 5. Set up the demo lot
+
+- Draw four slots on an A4 sheet.
+- Mount the camera about **30 cm above** the sheet, pointing straight down, under even
+  room light.
+- Edit `SLOT_ROIS` in `esp32cam.ino` so each box covers one slot. Check the alignment at
+  http://192.168.4.1:81/.
+- Press **Settings → Recalibrate camera** with the sheet empty.
+
+## Documentation
+
+- **[docs/HARDWARE.md](docs/HARDWARE.md):** parts, wiring for classic ESP32 and ESP32-S3, power
+- **[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md):** detection algorithm, ESP-NOW, gate logic, tickets
+- **[docs/API.md](docs/API.md):** HTTP endpoints of both nodes
+- **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md):** upload, Wi-Fi, camera and dashboard problems
+- **[dashboard/README.md](dashboard/README.md):** dashboard development
+
+## Hosting the dashboard
+
+The dashboard is a static site (`npm run build` → `dashboard/dist/`).
+
+| Where | Live hardware? | Notes |
+|---|---|---|
+| **Laptop on ParkingCam** (`npm start`) | ✅ | Recommended. Phones can open it through the laptop's IP |
+| Any static host (GitHub Pages, Vercel, Netlify) | Demo mode only | Browsers block an `https://` site from talking to `http://` devices on a local network. Add `?mock` to the URL for the simulator |
 
 ## Known limitations
 
-- **One stream viewer at a time.** The ESP32-CAM's `esp_http_server` serves one MJPEG client.
-  A second viewer sees "Camera Offline" and retries every 5 s. The dashboard closes its stream
-  when you switch tabs, so the slot is freed.
-- **No internet on the AP.** The Inter font can't load from Google Fonts, so the system font is used.
-  Phones may warn "no internet". Choose *Stay connected*, and on Android turn off
-  *Switch to mobile data* for this network.
-- **Wrong reference if cars are present.** The automatic first-boot calibration assumes the lot is empty.
-  If cars were parked at the time, recalibrate.
-- **Session data resets.** History and the entry counter are kept in RAM and reset when the S3 reboots.
+- **One video viewer at a time.** The ESP32-CAM serves a single stream viewer.
+- **No internet on ParkingCam.** Start the dashboard before joining it.
+- **Session data is lost on reboot.** Tickets, events and history are kept in the controller's
+  RAM and reset when it restarts.
+- **Fixed camera position.** Moving the camera or the sheet requires recalibration.

@@ -7,6 +7,7 @@ import TicketsTable from "../components/TicketsTable";
 import Timeline from "../components/Timeline";
 import { useEvents } from "../hooks/useEvents";
 import { useTickets } from "../hooks/useTickets";
+import { useNodes } from "../hooks/useNodes";
 import { useConfig } from "../hooks/useConfig";
 import { useHistory } from "../hooks/useHistory";
 import type { ParkingStatus } from "../types/parking";
@@ -17,10 +18,12 @@ interface Props {
 }
 
 export default function Analytics({ data }: Props) {
-  const { history, error } = useHistory(5000);
-  const { config } = useConfig();
-  const { events } = useEvents(2000);
-  const { tickets } = useTickets(3000);
+  const { camera, controller } = useNodes();
+  const ctrlHost = controller?.host.trim() ?? "";
+  const { history, error } = useHistory(ctrlHost, 5000);
+  const { config } = useConfig(camera?.host.trim() ?? "");
+  const { events } = useEvents(ctrlHost, 2000);
+  const { tickets } = useTickets(ctrlHost, 3000);
   const fees = Object.fromEntries(
     (tickets?.tickets ?? []).filter((t) => t.state === "closed").map((t) => [t.id, t.fee]),
   );
@@ -45,7 +48,7 @@ export default function Analytics({ data }: Props) {
         <StatsCard
           label="Cars entered"
           value={data.cars_entered}
-          hint={`${events.filter((e) => e.type === "entry_denied").length} turned away`}
+          hint={`${data.cars_denied} refused`}
         />
         <StatsCard label="Uptime" value={<span className="font-mono text-[26px]">{formatHms(data.uptime_s)}</span>} hint="Since controller boot" />
       </div>
@@ -54,7 +57,7 @@ export default function Analytics({ data }: Props) {
 
       <div className="grid gap-4 lg:grid-cols-2">
         <EventLog events={events} currency={tickets?.currency ?? "INR"} fees={fees} />
-        <TicketsTable data={tickets} />
+        <TicketsTable data={tickets} controllerHost={ctrlHost} />
       </div>
 
       {history ? (
@@ -135,8 +138,9 @@ export default function Analytics({ data }: Props) {
           title="System"
           items={[
             { label: "Uptime", value: formatHms(data.uptime_s), mono: true },
-            { label: "Camera", value: data.cam_online ? "Online" : <span className="text-danger">Offline</span> },
-            { label: "Gate", value: data.gate_open ? "Open" : "Closed" },
+            { label: "Camera node", value: data.sources.camera ? "Online" : <span className="text-danger">Offline</span> },
+            { label: "Controller node", value: data.sources.controller ? "Online" : <span className="text-danger">Offline</span> },
+            { label: "Gate", value: `${data.gate_open ? "Open" : "Closed"} (${data.gate_mode})` },
             {
               label: "Session started",
               value:

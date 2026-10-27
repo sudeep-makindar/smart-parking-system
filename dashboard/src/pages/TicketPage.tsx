@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 import { formatMoney, getTicket } from "../api/parking";
+import { useNodes } from "../hooks/useNodes";
 import type { Ticket } from "../types/parking";
 import { formatHms } from "../utils/format";
 
@@ -8,6 +9,10 @@ import { formatHms } from "../utils/format";
 export default function TicketPage() {
   const { id } = useParams();
   const ticketId = Number(id);
+  // The QR code carries the controller's address, so a phone without saved nodes can still load it
+  const [params] = useSearchParams();
+  const { controller } = useNodes();
+  const host = params.get("node") ?? controller?.host.trim() ?? "";
   const [ticket, setTicket] = useState<Ticket | null>(null);
   const [fetchedAt, setFetchedAt] = useState(Date.now());
   const [error, setError] = useState<string | null>(null);
@@ -16,7 +21,7 @@ export default function TicketPage() {
   useEffect(() => {
     let alive = true;
     const load = () =>
-      getTicket(ticketId)
+      getTicket(host, ticketId)
         .then((t) => {
           if (!alive) return;
           setTicket(t);
@@ -32,7 +37,7 @@ export default function TicketPage() {
       clearInterval(poll);
       clearInterval(clock);
     };
-  }, [ticketId]);
+  }, [ticketId, host]);
 
   const live = ticket && ticket.state !== "closed";
   const elapsed = ticket ? ticket.duration_s + (live ? Math.floor((Date.now() - fetchedAt) / 1000) : 0) : 0;
@@ -58,7 +63,7 @@ export default function TicketPage() {
           <div className="panel p-6 text-center">
             <p className="text-[15px] font-semibold">Ticket not found</p>
             <p className="mt-2 text-[13px] text-txt-secondary">
-              {error}. Make sure you are connected to the SmartParking Wi-Fi.
+              {error}. Make sure this phone is on the same Wi-Fi as the parking system.
             </p>
           </div>
         ) : !ticket ? (
