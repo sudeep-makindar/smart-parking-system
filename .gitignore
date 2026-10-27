@@ -1,0 +1,6 @@
+node_modules/
+dashboard/dist/
+firmware/esp32s3/data/
+firmware/esp32s3/.spiffs_build/
+.DS_Store
+*.tsbuildinfo
