@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { ticketUrl } from "../api/parking";
 import LiveClock from "../components/LiveClock";
 import TicketQR from "../components/TicketQR";
+import { useNodes } from "../hooks/useNodes";
 import type { ParkingState } from "../hooks/useParking";
 import { guidanceSlot } from "../utils/format";
 
@@ -29,6 +30,7 @@ const spoken = (bay: string) => bay.split("").join(" ");
 /** Full-screen display for a tablet or monitor at the entrance. */
 export default function SignPage({ parking }: { parking: ParkingState }) {
   const { data, isConnected } = parking;
+  const { controller } = useNodes();
   const [voice, setVoice] = useState(readVoicePref);
   const prevGate = useRef<boolean | null>(null);
   const prevDenied = useRef(false);
@@ -45,8 +47,9 @@ export default function SignPage({ parking }: { parking: ParkingState }) {
     }
     prevGate.current = data.gate_open;
 
-    const denied = data.ir_active && data.free_count === 0 && !data.gate_open;
-    if (voice && denied && !prevDenied.current) speak("Sorry, the car park is full. Please wait.");
+    const denied = data.ir_active && !data.gate_open && (data.free_count === 0 || data.gate_mode === "closed");
+    if (voice && denied && !prevDenied.current)
+      speak(data.gate_mode === "closed" ? "Sorry, the entrance is closed." : "Sorry, the car park is full. Please wait.");
     prevDenied.current = denied;
   }, [data, voice, ticket]);
 
@@ -98,7 +101,7 @@ export default function SignPage({ parking }: { parking: ParkingState }) {
               </p>
             </div>
             <div className="flex flex-col items-center gap-4">
-              <TicketQR value={ticketUrl(ticket.id)} size={240} className="p-2" />
+              <TicketQR value={ticketUrl(ticket.id, controller?.host.trim() ?? "")} size={240} className="p-2" />
               <p className="text-center text-[15px] text-txt-secondary">
                 Scan for your ticket
                 <br />

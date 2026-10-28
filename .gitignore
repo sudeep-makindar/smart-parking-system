@@ -1,6 +1,8 @@
 node_modules/
 dashboard/dist/
-firmware/esp32s3/data/
-firmware/esp32s3/.spiffs_build/
 .DS_Store
+Thumbs.db
 *.tsbuildinfo
+.vscode/
+# Lab report (contains personal details)
+report/

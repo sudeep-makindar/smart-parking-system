@@ -1,4 +1,4 @@
-// In-browser simulation of the ESP32-S3 API so the dashboard can be explored
+// In-browser simulation of a camera node and a controller node so the dashboard can be explored
 // without any hardware. Enabled with `npm run dev:mock` or `?mock` in the URL.
 //
 // It mirrors the firmware: cars arrive at the gate, get a ticket, park
@@ -6,12 +6,14 @@
 // fast-forwarded on load so the timeline has history immediately.
 import type {
   ApiResult,
+  CameraConfig,
+  CameraStatus,
+  ControllerStatus,
   EventType,
   EventsResponse,
-  ParkingConfig,
+  GateMode,
   ParkingEvent,
   ParkingHistory,
-  ParkingStatus,
   Roi,
   ThresholdSettings,
   Ticket,
@@ -67,9 +69,14 @@ const tickets: SimTicket[] = [];
 let queue: Action[] = [];
 const settings: ThresholdSettings = { pix_thresh: 35, t_high: 0.3, t_low: 0.15 };
 let calibCount = 1;
-let gateOpen = false;
+let calibratingUntil = 0;
+let gateMode: GateMode = "auto";
+let autoOpen = false;
 let irActive = false;
+let buzzerUntil = 0;
 let carsEntered = 0;
+let carsDenied = 0;
+let camSeq = 0;
 let lastEntryMs = 0;
 let nextArrival = bootMs + 5000;
 let lastTick = bootMs;
@@ -108,18 +115,25 @@ function setSlot(i: number, occ: boolean, at: number) {
   }
 }
 
+const gateOpen = () => gateMode === "open" || (gateMode === "auto" && autoOpen);
+
 function arrive(at: number) {
   irActive = true;
   const free = firstFree();
-  if (free < 0) {
-    log(at, "entry_denied", -1);
+  if (gateMode === "closed" || (gateMode === "auto" && free < 0)) {
+    carsDenied++;
+    buzzerUntil = Date.now() + 400;
+    log(at, "entry_denied", -1, gateMode === "closed" ? 1 : 0);
     queue.push({ at: at + 2500, run: () => (irActive = false) });
     return;
   }
-  gateOpen = true;
   carsEntered++;
   lastEntryMs = at;
-  log(at, "gate_open", -1);
+  buzzerUntil = Date.now() + 200;
+  if (gateMode === "auto") {
+    autoOpen = true;
+    log(at, "gate_open", -1);
+  }
   const t: SimTicket = { id: 1001 + tickets.length, state: "entered", assigned: free, slot: -1, entryMs: at, exitMs: 0, fee: 0 };
   tickets.push(t);
   log(at, "ticket_issued", free, t.id);
@@ -131,12 +145,20 @@ function arrive(at: number) {
     return freeBays.includes(free) && Math.random() < 0.85 ? free : freeBays[Math.floor(Math.random() * freeBays.length)];
   };
   queue.push({ at: at + 2500, run: () => (irActive = false) });
-  queue.push({ at: at + 7500, run: (now) => { gateOpen = false; log(now, "gate_close", -1); } });
+  queue.push({
+    at: at + 7500,
+    run: (now) => {
+      if (gateMode === "auto" && autoOpen) {
+        autoOpen = false;
+        log(now, "gate_close", -1);
+      }
+    },
+  });
   queue.push({
     at: at + rand(9000, 14000),
     run: (now) => {
       const i = bay();
-      if (i < 0) return;
+      if (i < 0 || free < 0) return;
       setSlot(i, true, now);
       queue.push({ at: now + rand(40_000, 150_000), run: (later) => setSlot(i, false, later) });
     },
@@ -181,12 +203,18 @@ function toTicket(t: SimTicket, now: number): Ticket {
 }
 
 export const mockApi = {
-  getStatus(): Promise<ParkingStatus> {
+  controllerStatus(): Promise<ControllerStatus> {
     const now = Date.now();
     tick(now);
     const free = firstFree();
     const last = tickets[tickets.length - 1];
+    const open = gateOpen();
     return delay({
+      node: "controller",
+      name: "parking-gate",
+      firmware: "2.0.0-mock",
+      ip: "192.168.43.21",
+      rssi: -52,
       zone: "A",
       slots: slots.map((s) => ({
         id: s.id,
@@ -195,23 +223,65 @@ export const mockApi = {
         since: s.occupied ? Math.floor(s.sinceMs / 1000) : 0,
         occupied_for_s: s.occupied ? Math.floor((now - s.sinceMs) / 1000) : 0,
       })),
+      leds: { slots: slots.map((s) => !s.occupied), pass: open, stop: !open },
       free_count: slots.filter((s) => !s.occupied).length,
       total_slots: slots.length,
-      gate_open: gateOpen,
-      cam_online: true,
-      uptime_s: Math.floor((now - bootMs) / 1000),
       guidance: free >= 0 ? `Go to Slot ${slots[free].id}` : "Parking Full",
-      cam_stream_url: "",
+      cam_online: true,
+      cam_last_seen_ms: Math.round(rand(20, 480)),
+      gate_open: open,
+      gate_mode: gateMode,
+      servo_angle: open ? 90 : 0,
       ir_active: irActive,
+      buzzer_on: now < buzzerUntil,
+      uptime_s: Math.floor((now - bootMs) / 1000),
       cars_entered: carsEntered,
+      cars_denied: carsDenied,
       last_entry_ago_s: lastEntryMs ? Math.floor((now - lastEntryMs) / 1000) : -1,
       time_synced: true,
-      cam_last_seen_ms: Math.round(rand(20, 480)),
       event_seq: events.length,
       last_ticket: last
         ? { id: last.id, bay: slots[last.assigned]?.id ?? null, entry_ago_s: Math.floor((now - last.entryMs) / 1000) }
         : null,
     });
+  },
+
+  cameraStatus(): Promise<CameraStatus> {
+    const now = Date.now();
+    tick(now);
+    return delay({
+      node: "camera",
+      name: "parking-cam",
+      firmware: "2.0.0-mock",
+      zone: "A",
+      slots: slots.map((s) => (s.occupied ? 1 : 0)),
+      scores: slots.map((s) => s.score),
+      seq: camSeq++ % 256,
+      uptime_s: Math.floor((now - bootMs) / 1000),
+      calibrated: true,
+      calibrating: now < calibratingUntil,
+      calib_count: calibCount,
+      ip: "192.168.43.20",
+      rssi: -58,
+      stream_port: 81,
+    });
+  },
+
+  setGateMode(mode: GateMode): Promise<ApiResult> {
+    if (mode !== gateMode) {
+      const wasOpen = gateOpen();
+      autoOpen = mode === "auto" && wasOpen; // don't drop the arm onto a car
+      gateMode = mode;
+      log(Date.now(), "gate_mode", -1, mode === "auto" ? 0 : mode === "open" ? 1 : 2);
+      if (gateOpen() !== wasOpen) log(Date.now(), gateOpen() ? "gate_open" : "gate_close", -1);
+      buzzerUntil = Date.now() + 200;
+    }
+    return delay({ ok: true });
+  },
+
+  buzzer(): Promise<ApiResult> {
+    buzzerUntil = Date.now() + 300;
+    return delay({ ok: true });
   },
 
   getHistory(): Promise<ParkingHistory> {
@@ -253,40 +323,30 @@ export const mockApi = {
     return t ? delay(toTicket(t, now)) : Promise.reject(new Error("Ticket not found"));
   },
 
-  getConfig(): Promise<ParkingConfig> {
+  cameraConfig(): Promise<CameraConfig> {
     return delay({
-      firmware_version: "1.1.0-mock",
-      ap_ssid: "SmartParking",
-      ap_password: "park1234",
-      ap_ip: "192.168.4.1",
-      ap_channel: 1,
-      ap_clients: 1,
-      cam_stream_url: "http://192.168.4.2:81/stream",
+      node: "camera",
+      firmware: "2.0.0-mock",
       zone: "A",
       total_slots: 4,
-      cam_config_received: true,
+      frame_w: 320,
+      frame_h: 240,
       ...settings,
       calibrated: true,
       calib_count: calibCount,
       rois: MOCK_ROIS,
       ref_patch: MOCK_REF,
-      fee_per_hour: FEE_PER_HOUR,
-      fee_minimum: FEE_MINIMUM,
-      currency: "INR",
     });
   },
 
   calibrate(): Promise<ApiResult> {
-    setTimeout(() => {
-      calibCount++;
-      log(Date.now(), "calibrated", -1, calibCount);
-    }, 2500);
+    calibratingUntil = Date.now() + 2500;
+    setTimeout(() => calibCount++, 2500);
     return delay({ ok: true });
   },
 
   updateSettings(next: ThresholdSettings): Promise<ApiResult> {
     Object.assign(settings, next);
-    log(Date.now(), "settings", -1, next.pix_thresh);
     return delay({ ok: true });
   },
 };

@@ -1,21 +1,19 @@
 # Smart Parking Dashboard
 
-Vite + React 18 + TypeScript + Tailwind CSS 3. It is served by the ESP32-S3 from SPIFFS.
+A Vite + React 18 + TypeScript + Tailwind CSS 3 app. It talks to the camera and controller
+nodes over HTTP; you enter their addresses in **Settings → Nodes** (saved in the browser).
 
 ```bash
 npm install
-npm run dev:mock    # simulated data, no hardware
-npm run dev         # real hardware (see .env.example)
-npm run build       # -> dist/ (~75 KB gzipped)
+npm run dev:mock    # simulated nodes, no hardware
+npm run dev         # real hardware, dev server reachable from other devices on the Wi-Fi
+npm start           # production build served on http://<this-computer>:4173
 ```
 
-- `src/api/parking.ts` is the fetch layer. In production it uses same-origin URLs. In dev it
-  uses `VITE_API_URL` (default `http://192.168.4.1`).
-- `src/api/mock.ts` is the in-browser simulator. Enable it with `VITE_MOCK=1` or `?mock` in the URL.
-- `src/hooks/useParking.ts` polls `/api/status` every 1.5 s. It keeps the last good data while
-  offline and tracks latency and success rate.
-- Routing uses `HashRouter` (`/#/analytics`), so the ESP32 needs no SPA fallback route.
-- Build output is flat with short hashed names (`a-XXXXXXXX.js`), because SPIFFS file names are
-  limited to 31 characters and SPIFFS has no folders.
-
-To deploy, run `../scripts/upload_dashboard.sh <serial-port>` from the repo root.
+- `src/hooks/useNodes.tsx`: the node registry. The first camera and first controller are the
+  "primary" nodes used by the pages.
+- `src/hooks/useParking.ts`: polls both primary nodes every second. It takes the slot array
+  directly from the camera node and adds durations, gate and tickets from the controller.
+- `src/api/parking.ts`: all node requests. `src/api/mock.ts` is the simulator; enable it with
+  `VITE_MOCK=1` or `?mock` in the URL.
+- Routing uses `HashRouter`, so the build works from any static host (laptop, Vercel, Netlify).

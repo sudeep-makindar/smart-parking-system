@@ -1,30 +1,36 @@
 /*
- * Smart Parking System — ESP32-S3 main controller
- * ------------------------------------------------
- *  - Wi-Fi Soft-AP "SmartParking" / "park1234" on channel 1 (IP 192.168.4.1)
- *  - Receives slot states from the ESP32-CAM over ESP-NOW
- *  - Drives 4 green + 4 red slot LEDs, an SSD1306 OLED and the SG90 entry gate
- *  - Serves the React dashboard from SPIFFS and a JSON API:
- *        GET  /api/status     live slot states, gate, camera health
- *        GET  /api/history    per-slot occupied time + change counts
- *        GET  /api/config     static info, thresholds and ROIs reported by the camera
- *        POST /api/calibrate  relay "recalibrate" to the camera
- *        POST /api/settings   relay {"pix_thresh","t_high","t_low"} to the camera
- *        POST /api/time       {"epoch": <unix seconds>} sets the clock (no RTC on board)
- *        GET  /api/events     ?since=<seq> event log for the timeline
- *        GET  /api/tickets    recent parking tickets;  GET /api/ticket?id=1001
+ * Smart Parking System — CONTROLLER NODE (classic ESP32 / ESP32-WROOM-32)
+ * -----------------------------------------------------------------------
+ *  - Joins your Wi-Fi (e.g. a phone hotspot) like every other node
+ *  - Receives the slot array from the camera node over ESP-NOW
+ *  - Drives the hardware:
+ *      4 slot LEDs (on = free), green PASS LED, red STOP LED, buzzer,
+ *      SG90 servo gate, entry IR sensor, SSD1306 OLED
+ *  - Gate modes: AUTO (opens for a car when a slot is free), OPEN, CLOSED,
+ *    switchable from the dashboard
+ *  - Issues parking tickets with fees and keeps an event log
+ *  - JSON API for the dashboard (CORS enabled, works from any host):
+ *        GET  /api/status        slots, gate, IR, LEDs, buzzer, camera link, counters
+ *        GET  /api/history       per-slot occupied time + change counts
+ *        GET  /api/events        ?since=<seq> event log for the timeline
+ *        GET  /api/tickets       recent tickets;  GET /api/ticket?id=1001
+ *        POST /api/gate          {"mode":"auto"|"open"|"closed"}
+ *        POST /api/buzzer        {"pattern":"beep"|"double"|"long"}  (test)
+ *        POST /api/time          {"epoch": <unix seconds>} sets the clock (no RTC on board)
  *
- * Arduino IDE 2.x, board "ESP32S3 Dev Module", ESP32 core 2.0.x or 3.x
- *   Tools > Partition Scheme: any scheme with SPIFFS, e.g.
- *     "Default 4MB with spiffs (1.2MB APP/1.5MB SPIFFS)"   or
- *     "8M with spiffs (3MB APP/1.5MB SPIFFS)"
- *   Tools > USB CDC On Boot: Enabled (to see Serial over the native USB port)
+ * Arduino IDE 2.x, ESP32 core 2.0.x or 3.x. Works on either board (pins are picked automatically):
+ *   classic ESP32: board "ESP32 Dev Module", Partition Scheme "Default 4MB with spiffs"
+ *   ESP32-S3:      board "ESP32S3 Dev Module", USB CDC On Boot "Enabled", PSRAM "Disabled"
  *
  * Libraries (Library Manager):
  *   ESPAsyncWebServer + AsyncTCP   (by ESP32Async — required for core 3.x)
  *   ArduinoJson 7.x                (by Benoit Blanchon)
  *   Adafruit SSD1306 + Adafruit GFX
  *   ESP32Servo                     (by Kevin Harrington / madhephaestus)
+ *
+ * Set WIFI_SSID / WIFI_PASS below (same network as the camera node). The OLED
+ * and Serial Monitor show this node's IP: add it in the dashboard under
+ * Settings > Nodes as a "controller".
  */
 
 #include <Arduino.h>
@@ -32,11 +38,12 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
-#include <SPIFFS.h>
+#include <ESPmDNS.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <ESP32Servo.h>
+#include <driver/gpio.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
@@ -47,40 +54,64 @@
 #error "This sketch needs ArduinoJson 7.x (Library Manager > ArduinoJson)"
 #endif
 
-#define FIRMWARE_VERSION "1.1.0"
+#define FIRMWARE_VERSION "2.0.0"
 
 // ───────────────────────────── Network ─────────────────────────────
-static const char *AP_SSID = "SmartParking";
-static const char *AP_PASS = "park1234";
-static const uint8_t AP_CHANNEL = 1;       // ESP-NOW and the Soft-AP share the radio: must match the camera
-static const uint8_t AP_MAX_CLIENTS = 8;   // camera + phones/laptops
-static const IPAddress AP_IP(192, 168, 4, 1);
-static const IPAddress AP_MASK(255, 255, 255, 0);
-static const char *CAM_STREAM_URL = "http://192.168.4.2:81/stream";
+// The camera node creates this Wi-Fi; joining it puts ESP-NOW on the same channel
+static const char *WIFI_SSID = "ParkingCam";  // the camera node's own Wi-Fi
+static const char *WIFI_PASS = "park1234";
+static const char *NODE_NAME = "parking-gate";  // also reachable as http://parking-gate.local
 
 // ───────────────────────────── Pins ────────────────────────────────
+// The right set is picked automatically from the board selected in Tools > Board.
+static const uint8_t NUM_SLOTS = 4;
+#if CONFIG_IDF_TARGET_ESP32S3
+// ESP32-S3: avoids 19/20 (USB-C data), 0/3/45/46 (boot strapping),
+// 26-37 (flash/PSRAM) and 43/44 (UART0).
 static const uint8_t PIN_OLED_SDA = 8;
 static const uint8_t PIN_OLED_SCL = 9;
-static const uint8_t PIN_SERVO = 16;
-static const uint8_t PIN_IR = 17;
-static const uint8_t NUM_SLOTS = 4;
-static const uint8_t LED_GREEN[NUM_SLOTS] = {1, 3, 5, 7};
-static const uint8_t LED_RED[NUM_SLOTS] = {2, 4, 6, 15};
+static const uint8_t SLOT_LED[NUM_SLOTS] = {10, 11, 12, 13};  // A1..A4, lit = slot free
+static const uint8_t PIN_LED_PASS = 14;  // green: car may pass (gate open)
+static const uint8_t PIN_LED_STOP = 21;  // red: car must stop (gate closed)
+static const uint8_t PIN_BUZZER = 4;
+static const uint8_t PIN_SERVO = 5;
+static const uint8_t PIN_IR = 6;
+#else
+// Classic ESP32: GPIO 6-11 are the flash chip, 1/3 are USB serial and
+// 0/2/5/12/15 are boot strapping pins, so none of them are used here.
+static const uint8_t PIN_OLED_SDA = 21;
+static const uint8_t PIN_OLED_SCL = 22;
+static const uint8_t SLOT_LED[NUM_SLOTS] = {25, 26, 27, 14};  // A1..A4, lit = slot free
+static const uint8_t PIN_LED_PASS = 32;  // green: car may pass (gate open)
+static const uint8_t PIN_LED_STOP = 33;  // red: car must stop (gate closed)
+static const uint8_t PIN_BUZZER = 23;
+static const uint8_t PIN_SERVO = 18;
+static const uint8_t PIN_IR = 19;
+#endif
 
 // Most IR obstacle modules pull OUT low when something is in front of them
 #define IR_ACTIVE_LEVEL LOW
+
+// 1 = drive the buzzer with a 2.4 kHz tone (works for passive AND active buzzers)
+// 0 = plain on/off (active buzzers only)
+#define BUZZER_TONE 1
+
+// 1 = weakest GPIO drive strength on the LED pins, so LEDs wired straight to a pin
+//     (no resistor) stay at a safe current. Fine with resistors too (slightly dimmer).
+// 0 = normal drive strength (only with a 150 ohm - 1 k resistor on every LED).
+#define LED_LOW_DRIVE 1
+static const uint16_t BUZZER_FREQ = 2400;
 
 // ───────────────────────────── Behaviour ───────────────────────────
 static const char ZONE_ID = 'A';
 static const int SERVO_CLOSED_DEG = 0;
 static const int SERVO_OPEN_DEG = 90;
-static const uint32_t GATE_CLOSE_DELAY_MS = 5000;  // gate closes 5 s after the IR sensor clears
+static const uint32_t GATE_CLOSE_DELAY_MS = 5000;  // AUTO: close 5 s after the IR sensor clears
 static const uint32_t IR_DEBOUNCE_MS = 50;
-static const uint32_t CAM_TIMEOUT_MS = 3000;       // cam_online=false after 3 s of silence
+static const uint32_t CAM_TIMEOUT_MS = 3000;       // camera offline after 3 s without ESP-NOW
+static const uint32_t DENIED_FLASH_MS = 2000;      // STOP LED flashes this long when a car is refused
 static const uint32_t DISPLAY_INTERVAL_MS = 500;
-static const uint8_t CMD_REPEATS = 3;              // broadcasts are unacknowledged, so send each command 3x
-static const uint32_t CMD_REPEAT_GAP_MS = 40;
-static const size_t MAX_BODY = 512;
+static const size_t MAX_BODY = 256;
 
 // Parking fee charged on each ticket (rounded up to whole minutes)
 static const uint16_t FEE_PER_HOUR = 20;
@@ -98,37 +129,12 @@ typedef struct __attribute__((packed)) {
   uint8_t scores[4];  // detection ratio x 100 (0-100)
   uint8_t sequence;   // rolling counter
 } parking_msg_t;
-
-#define CMD_MAGIC 0xC5
-enum : uint8_t { CMD_CALIBRATE = 1, CMD_SETTINGS = 2 };
-typedef struct __attribute__((packed)) {
-  uint8_t magic;       // CMD_MAGIC
-  uint8_t cmd;         // CMD_*
-  uint8_t cmd_id;      // camera ignores repeats of the same id
-  uint8_t pix_thresh;  // 10-80
-  uint8_t t_high_pct;  // T_HIGH x 100
-  uint8_t t_low_pct;   // T_LOW x 100
-} command_msg_t;
-
-#define CONFIG_MAGIC 0xCF
-typedef struct __attribute__((packed)) {
-  uint8_t magic;  // CONFIG_MAGIC
-  uint8_t zone_id;
-  uint8_t pix_thresh;
-  uint8_t t_high_pct;
-  uint8_t t_low_pct;
-  uint8_t calibrated;   // 1 if an empty reference exists
-  uint8_t calib_count;  // increments after each finished calibration
-  uint16_t roi[NUM_SLOTS + 1][4];  // x, y, w, h for slots 1-4, then the brightness reference patch
-} config_msg_t;
-
 static_assert(sizeof(parking_msg_t) == 10, "parking_msg_t layout");
-static_assert(sizeof(command_msg_t) == 6, "command_msg_t layout");
-static_assert(sizeof(config_msg_t) == 47, "config_msg_t layout");
-
-static const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 // ───────────────────────────── State ───────────────────────────────
+enum GateMode : uint8_t { GATE_AUTO, GATE_OPEN, GATE_CLOSED };
+static const char *GATE_MODE_NAMES[] = {"auto", "open", "closed"};
+
 struct SlotState {
   bool occupied;
   uint8_t score;
@@ -142,17 +148,19 @@ struct SharedState {
   bool haveCamData;
   uint32_t lastCamMsgMs;
   uint8_t lastSeq;
-  bool haveCamConfig;
-  config_msg_t camConfig;
+  GateMode gateMode;
   bool gateOpen;
   bool irActive;
+  bool buzzerOn;
   uint32_t carsEntered;
+  uint32_t carsDenied;
   bool everEntered;
   uint32_t lastEntryMs;
+  uint32_t deniedFlashUntil;
   bool timeSynced;
 };
 
-// Everything the web server (async_tcp task) reads is guarded by stateMutex
+// Everything the web server (async_tcp task) touches is guarded by stateMutex
 static SharedState state;
 static SemaphoreHandle_t stateMutex;
 
@@ -165,21 +173,12 @@ struct Lock {
 static portMUX_TYPE rxMux = portMUX_INITIALIZER_UNLOCKED;
 static parking_msg_t rxStatus;
 static volatile bool rxStatusPending = false;
-static config_msg_t rxConfig;
-static volatile bool rxConfigPending = false;
 
-// Web handlers -> loop() command queue (one pending command at a time)
-static command_msg_t pendingCmd;
-static uint8_t cmdRepeatsLeft = 0;
-static uint32_t lastCmdSendMs = 0;
-static uint8_t nextCmdId = 1;
+// Requests from the web server -> loop()
+static int8_t requestedMode = -1;        // GateMode, -1 = none
+static const uint8_t *requestedBeep = nullptr;
 
-static Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
-static bool displayOk = false;
-static Servo gateServo;
-static AsyncWebServer server(80);
-
-// Event log and tickets (declared here so Arduino's generated prototypes can see the types)
+// Event log and tickets (declared before any function so Arduino's generated prototypes see the types)
 enum : uint8_t {
   EV_SLOT_OCCUPIED = 1,
   EV_SLOT_FREE,
@@ -190,18 +189,18 @@ enum : uint8_t {
   EV_TICKET_CLOSED,
   EV_CAM_ONLINE,
   EV_CAM_OFFLINE,
-  EV_CALIBRATED,
-  EV_SETTINGS,
+  EV_GATE_MODE,
 };
-static const char *EVENT_NAMES[] = {"",           "slot_occupied", "slot_free",  "gate_open",  "gate_close", "entry_denied",
-                                    "ticket_issued", "ticket_closed", "cam_online", "cam_offline", "calibrated", "settings"};
+static const char *EVENT_NAMES[] = {"",           "slot_occupied", "slot_free",     "gate_open",  "gate_close",
+                                    "entry_denied", "ticket_issued", "ticket_closed", "cam_online", "cam_offline",
+                                    "gate_mode"};
 
 struct Event {
   uint32_t seq;
   uint32_t ms;
   uint8_t type;
   int8_t slot;     // -1 if not slot related
-  uint16_t value;  // score, ticket id or fee depending on type
+  uint16_t value;  // score, ticket id, gate mode or denial reason depending on type
 };
 static const uint8_t EVENT_CAP = 120;
 static Event events[EVENT_CAP];
@@ -212,8 +211,8 @@ static const char *TICKET_STATES[] = {"entered", "parked", "closed"};
 
 struct Ticket {
   uint16_t id;
-  int8_t assignedSlot;  // bay suggested at the gate
-  int8_t slot;          // bay actually used, -1 until parked
+  int8_t assignedSlot;  // slot suggested at the gate, -1 if none
+  int8_t slot;          // slot actually used, -1 until parked
   uint8_t state;
   uint32_t entryMs, parkedMs, exitMs;
   uint16_t fee;
@@ -222,6 +221,20 @@ static const uint8_t TICKET_CAP = 16;
 static Ticket tickets[TICKET_CAP];
 static uint16_t ticketCount = 0;  // tickets issued since boot
 static const uint16_t FIRST_TICKET_ID = 1001;
+
+// Buzzer patterns: alternating on/off durations in ms, 0-terminated
+static const uint8_t BEEP_SHORT[] = {12, 0};           // x10 ms
+static const uint8_t BEEP_DOUBLE[] = {10, 8, 10, 0};
+static const uint8_t BEEP_LONG[] = {60, 0};
+static const uint8_t BEEP_BOOT[] = {6, 6, 6, 0};
+
+static Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
+static bool displayOk = false;
+static Servo gateServo;
+#if BUZZER_TONE
+static ESP32PWM buzzerPwm;
+#endif
+static AsyncWebServer server(80);
 
 // ───────────────────────────── Helpers ─────────────────────────────
 static bool camOnlineLocked(uint32_t now) {
@@ -257,9 +270,6 @@ static void guidanceLocked(char *buf, size_t len) {
 }
 
 // ───────────────────────────── Events & tickets ────────────────────
-// Ring buffer of everything that happens, served at /api/events for the
-// dashboard timeline. Timestamps are millis() since boot.
-
 static void logEventLocked(uint8_t type, int8_t slot, uint16_t value) {
   eventSeq++;
   Event &e = events[(eventSeq - 1) % EVENT_CAP];
@@ -269,9 +279,6 @@ static void logEventLocked(uint8_t type, int8_t slot, uint16_t value) {
   e.slot = slot;
   e.value = value;
 }
-
-// A ticket is issued when the gate opens, bound to the bay the car actually
-// parks in, and closed (with a fee) when that bay becomes free again.
 
 static uint16_t computeFee(uint32_t durationMs) {
   uint32_t minutes = (durationMs + 59999) / 60000;
@@ -297,10 +304,11 @@ static void issueTicketLocked(uint32_t now) {
   t.fee = 0;
   ticketCount++;
   logEventLocked(EV_TICKET_ISSUED, t.assignedSlot, t.id);
-  Serial.printf("[TICKET] #%u issued, go to %c%d\n", t.id, ZONE_ID, t.assignedSlot + 1);
+  if (t.assignedSlot >= 0) Serial.printf("[TICKET] #%u issued, go to %c%d\n", t.id, ZONE_ID, t.assignedSlot + 1);
+  else Serial.printf("[TICKET] #%u issued (no free slot)\n", t.id);
 }
 
-// Oldest ticket still waiting to park, preferring one that was sent to this bay
+// Oldest ticket still waiting to park, preferring one that was sent to this slot
 static Ticket *unparkedTicketForLocked(int8_t slot) {
   Ticket *fallback = nullptr;
   uint16_t first = ticketCount > TICKET_CAP ? ticketCount - TICKET_CAP : 0;
@@ -346,11 +354,6 @@ static void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
     memcpy(&rxStatus, data, sizeof(rxStatus));
     rxStatusPending = true;
     portEXIT_CRITICAL(&rxMux);
-  } else if (len == sizeof(config_msg_t) && data[0] == CONFIG_MAGIC) {
-    portENTER_CRITICAL(&rxMux);
-    memcpy(&rxConfig, data, sizeof(rxConfig));
-    rxConfigPending = true;
-    portEXIT_CRITICAL(&rxMux);
   }
 }
 
@@ -361,148 +364,108 @@ static void setupEspNow() {
     ESP.restart();
   }
   esp_now_register_recv_cb(onEspNowRecv);
-
-  esp_now_peer_info_t peer = {};
-  memcpy(peer.peer_addr, BROADCAST_MAC, 6);
-  peer.channel = AP_CHANNEL;
-  peer.ifidx = WIFI_IF_AP;
-  peer.encrypt = false;
-  if (esp_now_add_peer(&peer) != ESP_OK) Serial.println("[ESP-NOW] add broadcast peer failed");
 }
 
-// Called from web handlers; loop() does the actual (repeated) sending
-static void queueCommand(uint8_t cmd, uint8_t pix, uint8_t tHighPct, uint8_t tLowPct) {
-  Lock l;
-  pendingCmd.magic = CMD_MAGIC;
-  pendingCmd.cmd = cmd;
-  pendingCmd.cmd_id = nextCmdId++;
-  if (nextCmdId == 0) nextCmdId = 1;
-  pendingCmd.pix_thresh = pix;
-  pendingCmd.t_high_pct = tHighPct;
-  pendingCmd.t_low_pct = tLowPct;
-  cmdRepeatsLeft = CMD_REPEATS;
-  lastCmdSendMs = 0;
-}
-
-static void serviceCommands(uint32_t now) {
-  command_msg_t msg;
-  {
-    Lock l;
-    if (cmdRepeatsLeft == 0 || (lastCmdSendMs && now - lastCmdSendMs < CMD_REPEAT_GAP_MS)) return;
-    msg = pendingCmd;
-    cmdRepeatsLeft--;
-    lastCmdSendMs = now;
-  }
-  esp_err_t err = esp_now_send(BROADCAST_MAC, (const uint8_t *)&msg, sizeof(msg));
-  if (err != ESP_OK) Serial.printf("[ESP-NOW] send cmd %u failed: %d\n", msg.cmd, err);
-}
-
-// Applies packets received by the callback; returns true if any slot changed
-static bool processEspNow(uint32_t now) {
-  bool changed = false;
+// Applies the newest camera packet
+static void processEspNow(uint32_t now) {
   parking_msg_t st;
-  config_msg_t cfg;
-  bool haveSt = false, haveCfg = false;
-
+  bool have = false;
   portENTER_CRITICAL(&rxMux);
   if (rxStatusPending) {
     st = rxStatus;
     rxStatusPending = false;
-    haveSt = true;
-  }
-  if (rxConfigPending) {
-    cfg = rxConfig;
-    rxConfigPending = false;
-    haveCfg = true;
+    have = true;
   }
   portEXIT_CRITICAL(&rxMux);
+  if (!have) return;
 
-  if (haveSt) {
-    Lock l;
-    for (uint8_t i = 0; i < NUM_SLOTS; i++) {
-      SlotState &s = state.slots[i];
-      bool occ = st.slots[i] != 0;
-      s.score = st.scores[i] > 100 ? 100 : st.scores[i];
-      if (!state.haveCamData) {
-        // First packet after boot: adopt the state without counting it as a change
-        s.occupied = occ;
-        s.sinceMs = occ ? now : 0;
-        changed = true;
-      } else if (occ != s.occupied) {
-        if (s.occupied) s.totalOccupiedMs += now - s.sinceMs;
-        s.occupied = occ;
-        s.sinceMs = occ ? now : 0;
-        s.changeCount++;
-        changed = true;
-        logEventLocked(occ ? EV_SLOT_OCCUPIED : EV_SLOT_FREE, i, s.score);
-        if (occ) onSlotOccupiedLocked(i, now);
-        else onSlotFreedLocked(i, now);
-      }
+  bool changed = false;
+  Lock l;
+  for (uint8_t i = 0; i < NUM_SLOTS; i++) {
+    SlotState &s = state.slots[i];
+    bool occ = st.slots[i] != 0;
+    s.score = st.scores[i] > 100 ? 100 : st.scores[i];
+    if (!state.haveCamData) {
+      // First packet after boot: adopt the state without counting it as a change
+      s.occupied = occ;
+      s.sinceMs = occ ? now : 0;
+      changed = true;
+    } else if (occ != s.occupied) {
+      if (s.occupied) s.totalOccupiedMs += now - s.sinceMs;
+      s.occupied = occ;
+      s.sinceMs = occ ? now : 0;
+      s.changeCount++;
+      changed = true;
+      logEventLocked(occ ? EV_SLOT_OCCUPIED : EV_SLOT_FREE, i, s.score);
+      if (occ) onSlotOccupiedLocked(i, now);
+      else onSlotFreedLocked(i, now);
     }
-    if (!state.haveCamData) Serial.println("[CAM] first status packet received");
-    state.haveCamData = true;
-    state.lastCamMsgMs = now;
-    state.lastSeq = st.sequence;
   }
-
-  if (haveCfg) {
-    Lock l;
-    if (state.haveCamConfig && cfg.calib_count != state.camConfig.calib_count)
-      logEventLocked(EV_CALIBRATED, -1, cfg.calib_count);
-    if (!state.haveCamConfig || cfg.calib_count != state.camConfig.calib_count)
-      Serial.printf("[CAM] config: pix=%u high=%u%% low=%u%% calibrated=%u count=%u\n", cfg.pix_thresh,
-                    cfg.t_high_pct, cfg.t_low_pct, cfg.calibrated, cfg.calib_count);
-    state.camConfig = cfg;
-    state.haveCamConfig = true;
-  }
+  if (!state.haveCamData) Serial.println("[CAM] first ESP-NOW packet received");
+  state.haveCamData = true;
+  state.lastCamMsgMs = now;
+  state.lastSeq = st.sequence;
 
   if (changed) {
-    Lock l;
     Serial.print("[SLOTS]");
     for (uint8_t i = 0; i < NUM_SLOTS; i++)
       Serial.printf(" %c%u=%s(%u)", ZONE_ID, i + 1, state.slots[i].occupied ? "OCC" : "free", state.slots[i].score);
     Serial.println();
   }
-  return changed;
 }
 
-// ───────────────────────────── LEDs ────────────────────────────────
-static void updateLeds(uint32_t now) {
-  bool occ[NUM_SLOTS];
-  bool online, haveData;
-  {
-    Lock l;
-    online = camOnlineLocked(now);
-    haveData = state.haveCamData;
-    for (uint8_t i = 0; i < NUM_SLOTS; i++) occ[i] = state.slots[i].occupied;
-  }
-  bool blink = (now / 500) % 2;
-  for (uint8_t i = 0; i < NUM_SLOTS; i++) {
-    if (online) {
-      digitalWrite(LED_GREEN[i], occ[i] ? LOW : HIGH);
-      digitalWrite(LED_RED[i], occ[i] ? HIGH : LOW);
-    } else if (haveData) {
-      // Camera lost: blink the red LEDs so the fault is obvious
-      digitalWrite(LED_GREEN[i], LOW);
-      digitalWrite(LED_RED[i], blink ? HIGH : LOW);
-    } else {
-      // Booting / waiting for the first packet: slow green chase
-      digitalWrite(LED_GREEN[i], ((now / 300) % NUM_SLOTS) == i ? HIGH : LOW);
-      digitalWrite(LED_RED[i], LOW);
-    }
+// ───────────────────────────── Buzzer ──────────────────────────────
+static const uint8_t *beepPattern = nullptr;
+static uint8_t beepStep = 0;
+static uint32_t beepStepStartMs = 0;
+
+static void buzzerWrite(bool on) {
+#if BUZZER_TONE
+  buzzerPwm.writeScaled(on ? 0.5f : 0.0f);
+#else
+  digitalWrite(PIN_BUZZER, on ? HIGH : LOW);
+#endif
+  Lock l;
+  state.buzzerOn = on;
+}
+
+static void beep(const uint8_t *pattern) {
+  beepPattern = pattern;
+  beepStep = 0;
+  beepStepStartMs = millis();
+  buzzerWrite(true);
+}
+
+static void updateBuzzer(uint32_t now) {
+  if (!beepPattern) return;
+  if (now - beepStepStartMs < (uint32_t)beepPattern[beepStep] * 10) return;
+  beepStep++;
+  beepStepStartMs = now;
+  if (beepPattern[beepStep] == 0) {
+    beepPattern = nullptr;
+    buzzerWrite(false);
+  } else {
+    buzzerWrite(beepStep % 2 == 0);  // even steps sound, odd steps are pauses
   }
 }
 
 // ───────────────────────────── Gate ────────────────────────────────
-static void setGate(bool open) {
+static void moveServo(bool open) {
   gateServo.write(open ? SERVO_OPEN_DEG : SERVO_CLOSED_DEG);
   Serial.printf("[GATE] %s\n", open ? "OPEN" : "CLOSED");
 }
 
+// AUTO: a car at the IR sensor is let in when a slot is free; the gate closes
+// GATE_CLOSE_DELAY_MS after the sensor clears. A car refused while the lot is
+// full is let in as soon as a slot frees up, if it is still waiting.
+// OPEN / CLOSED: set from the dashboard, the gate holds that position.
 static void updateGate(uint32_t now) {
   static bool irRaw = false;
   static uint32_t irRawChangedMs = 0;
   static uint32_t irClearSinceMs = 0;
+  static bool carWaiting = false;   // arrived and not yet admitted
+  static bool deniedThisCar = false;
+  static bool autoHold = false;     // AUTO keeps the gate open for the current car
 
   bool raw = digitalRead(PIN_IR) == IR_ACTIVE_LEVEL;
   if (raw != irRaw) {
@@ -510,34 +473,100 @@ static void updateGate(uint32_t now) {
     irRawChangedMs = now;
   }
 
-  bool open = false, close = false;
+  const uint8_t *sound = nullptr;
+  bool moveTo = false, move = false;
   {
     Lock l;
-    if (now - irRawChangedMs >= IR_DEBOUNCE_MS && irRaw != state.irActive) {
-      state.irActive = irRaw;
-      if (!irRaw) irClearSinceMs = now;
-      else if (!state.gateOpen && freeCountLocked() == 0) logEventLocked(EV_ENTRY_DENIED, -1, 0);
+    // Mode change requested by the dashboard
+    if (requestedMode >= 0) {
+      GateMode m = (GateMode)requestedMode;
+      requestedMode = -1;
+      if (m != state.gateMode) {
+        state.gateMode = m;
+        logEventLocked(EV_GATE_MODE, -1, m);
+        Serial.printf("[GATE] mode -> %s\n", GATE_MODE_NAMES[m]);
+        sound = BEEP_SHORT;
+        autoHold = m == GATE_AUTO && state.gateOpen;  // don't drop the arm onto a car
+        irClearSinceMs = now;
+      }
     }
 
-    if (!state.gateOpen) {
-      // A car is waiting and there is room (a car waiting while full is let in as soon as a slot frees up)
-      if (state.irActive && freeCountLocked() > 0) {
-        state.gateOpen = true;
+    // Debounced IR edge = a car arrives
+    if (now - irRawChangedMs >= IR_DEBOUNCE_MS && irRaw != state.irActive) {
+      state.irActive = irRaw;
+      if (irRaw) carWaiting = true;
+      else {
+        irClearSinceMs = now;
+        carWaiting = false;
+        deniedThisCar = false;
+      }
+    }
+
+    if (carWaiting) {
+      bool admit = false, deny = false;
+      uint16_t reason = 0;
+      if (state.gateMode == GATE_OPEN) admit = true;
+      else if (state.gateMode == GATE_CLOSED) {
+        deny = !deniedThisCar;
+        reason = 1;
+      } else if (freeCountLocked() > 0) admit = true;
+      else deny = !deniedThisCar;
+
+      if (admit) {
+        carWaiting = false;
+        if (state.gateMode == GATE_AUTO) autoHold = true;
         state.carsEntered++;
         state.everEntered = true;
         state.lastEntryMs = now;
-        open = true;
-        logEventLocked(EV_GATE_OPEN, -1, 0);
         issueTicketLocked(now);
+        sound = BEEP_SHORT;
+      } else if (deny) {
+        deniedThisCar = true;
+        state.carsDenied++;
+        state.deniedFlashUntil = now + DENIED_FLASH_MS;
+        logEventLocked(EV_ENTRY_DENIED, -1, reason);
+        Serial.printf("[GATE] entry denied (%s)\n", reason ? "gate closed" : "lot full");
+        sound = BEEP_DOUBLE;
       }
-    } else if (!state.irActive && now - irClearSinceMs >= GATE_CLOSE_DELAY_MS) {
-      state.gateOpen = false;
-      close = true;
-      logEventLocked(EV_GATE_CLOSE, -1, 0);
+    }
+
+    if (autoHold && state.gateMode == GATE_AUTO && !state.irActive && now - irClearSinceMs >= GATE_CLOSE_DELAY_MS)
+      autoHold = false;
+
+    bool want = state.gateMode == GATE_OPEN || (state.gateMode == GATE_AUTO && autoHold);
+    if (want != state.gateOpen) {
+      state.gateOpen = want;
+      logEventLocked(want ? EV_GATE_OPEN : EV_GATE_CLOSE, -1, 0);
+      move = true;
+      moveTo = want;
     }
   }
-  if (open) setGate(true);
-  if (close) setGate(false);
+  if (move) moveServo(moveTo);
+  if (sound) beep(sound);
+}
+
+// ───────────────────────────── LEDs ────────────────────────────────
+static void updateLeds(uint32_t now) {
+  bool occ[NUM_SLOTS];
+  bool online, haveData, gateOpen, denied;
+  {
+    Lock l;
+    online = camOnlineLocked(now);
+    haveData = state.haveCamData;
+    gateOpen = state.gateOpen;
+    denied = (int32_t)(state.deniedFlashUntil - now) > 0;
+    for (uint8_t i = 0; i < NUM_SLOTS; i++) occ[i] = state.slots[i].occupied;
+  }
+  for (uint8_t i = 0; i < NUM_SLOTS; i++) {
+    bool on;
+    if (online) on = !occ[i];                              // lit = free
+    else if (haveData) on = (now / 500) % 2;               // camera lost: all blink together
+    else on = ((now / 250) % NUM_SLOTS) == i;              // waiting for the camera: chase
+    digitalWrite(SLOT_LED[i], on ? HIGH : LOW);
+  }
+  digitalWrite(PIN_LED_PASS, gateOpen ? HIGH : LOW);
+  // STOP: solid while closed, fast flash after refusing a car
+  digitalWrite(PIN_LED_STOP, gateOpen ? LOW : (denied ? ((now / 120) % 2 ? HIGH : LOW) : HIGH));
 }
 
 // ───────────────────────────── OLED ────────────────────────────────
@@ -547,6 +576,7 @@ static void updateDisplay(uint32_t now) {
   uint8_t freeCount;
   int firstFree;
   bool online, haveData, gateOpen;
+  GateMode mode;
   {
     Lock l;
     freeCount = freeCountLocked();
@@ -554,42 +584,35 @@ static void updateDisplay(uint32_t now) {
     online = camOnlineLocked(now);
     haveData = state.haveCamData;
     gateOpen = state.gateOpen;
+    mode = state.gateMode;
   }
 
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.print("SMART PARKING");
-  display.setCursor(OLED_WIDTH - 6 * 6, 0);
-  display.printf("ZONE %c", ZONE_ID);
-  display.drawFastHLine(0, 10, OLED_WIDTH, SSD1306_WHITE);
+  if (WiFi.status() == WL_CONNECTED) display.printf("IP %s", WiFi.localIP().toString().c_str());
+  else display.print("Connecting WiFi...");
+  display.setCursor(0, 10);
+  display.printf("Gate %s/%s", gateOpen ? "OPEN" : "SHUT", mode == GATE_AUTO ? "AUTO" : "MAN");
+  display.setCursor(OLED_WIDTH - 6 * 6, 10);
+  display.print(online ? "Cam OK" : "Cam --");
+  display.drawFastHLine(0, 19, OLED_WIDTH, SSD1306_WHITE);
 
   display.setTextSize(2);
   if (!haveData) {
     display.setTextSize(1);
-    display.setCursor(0, 22);
-    display.print("Waiting for camera...");
-    display.setCursor(0, 36);
-    display.printf("WiFi: %s", AP_SSID);
-  } else if (freeCount == 0) {
-    display.setCursor(0, 16);
-    display.printf("Free: 0/%u", NUM_SLOTS);
-    display.setTextSize(3);
-    display.setCursor(28, 34);
-    display.print("FULL");
+    display.setCursor(0, 30);
+    display.print("Waiting for camera");
+    display.setCursor(0, 42);
+    display.print("node (ESP-NOW)...");
   } else {
-    display.setCursor(0, 16);
-    display.printf("Free: %u/%u", freeCount, NUM_SLOTS);
-    display.setCursor(0, 36);
-    display.printf("Go to %c%d", ZONE_ID, firstFree + 1);
+    display.setCursor(0, 24);
+    display.printf("Free %u/%u", freeCount, NUM_SLOTS);
+    display.setCursor(0, 44);
+    if (freeCount == 0) display.print("FULL");
+    else display.printf("Go to %c%d", ZONE_ID, firstFree + 1);
   }
-
-  display.setTextSize(1);
-  display.setCursor(0, 56);
-  display.printf("Gate:%s", gateOpen ? "OPEN  " : "CLOSED");
-  display.setCursor(OLED_WIDTH - 6 * 7, 56);
-  display.print(online ? "Cam:OK " : "Cam:OFF");
   display.display();
 }
 
@@ -609,12 +632,6 @@ static void sendError(AsyncWebServerRequest *req, int code, const char *msg) {
   sendJson(req, doc, code);
 }
 
-static void sendOk(AsyncWebServerRequest *req) {
-  JsonDocument doc;
-  doc["ok"] = true;
-  sendJson(req, doc, 200);
-}
-
 // Accumulates small request bodies into req->_tempObject (freed by the library)
 static void collectBody(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t index, size_t total) {
   if (total > MAX_BODY) return;
@@ -625,14 +642,18 @@ static void collectBody(AsyncWebServerRequest *req, uint8_t *data, size_t len, s
 static void handleStatus(AsyncWebServerRequest *req) {
   JsonDocument doc;
   uint32_t now = millis();
+  doc["node"] = "controller";
+  doc["name"] = NODE_NAME;
+  doc["firmware"] = FIRMWARE_VERSION;
+  doc["ip"] = WiFi.localIP().toString();
+  doc["rssi"] = WiFi.RSSI();
   {
     Lock l;
-    bool online = camOnlineLocked(now);
-    uint8_t freeCount = freeCountLocked();
     char buf[32];
-
     doc["zone"] = String(ZONE_ID);
     JsonArray arr = doc["slots"].to<JsonArray>();
+    JsonArray leds = doc["leds"]["slots"].to<JsonArray>();
+    bool online = camOnlineLocked(now);
     for (uint8_t i = 0; i < NUM_SLOTS; i++) {
       const SlotState &s = state.slots[i];
       JsonObject o = arr.add<JsonObject>();
@@ -642,20 +663,26 @@ static void handleStatus(AsyncWebServerRequest *req) {
       o["score"] = s.score;
       o["since"] = s.occupied ? toTimestampLocked(s.sinceMs, now) : 0;
       o["occupied_for_s"] = s.occupied ? (now - s.sinceMs) / 1000 : 0;
+      leds.add(online && !s.occupied);
     }
-    doc["free_count"] = freeCount;
+    doc["leds"]["pass"] = state.gateOpen;
+    doc["leds"]["stop"] = !state.gateOpen;
+    doc["free_count"] = freeCountLocked();
     doc["total_slots"] = NUM_SLOTS;
-    doc["gate_open"] = state.gateOpen;
-    doc["cam_online"] = online;
-    doc["uptime_s"] = now / 1000;
     guidanceLocked(buf, sizeof(buf));
     doc["guidance"] = buf;
-    doc["cam_stream_url"] = CAM_STREAM_URL;
+    doc["cam_online"] = online;
+    doc["cam_last_seen_ms"] = state.haveCamData ? (int32_t)(now - state.lastCamMsgMs) : -1;
+    doc["gate_open"] = state.gateOpen;
+    doc["gate_mode"] = GATE_MODE_NAMES[state.gateMode];
+    doc["servo_angle"] = state.gateOpen ? SERVO_OPEN_DEG : SERVO_CLOSED_DEG;
     doc["ir_active"] = state.irActive;
+    doc["buzzer_on"] = state.buzzerOn;
+    doc["uptime_s"] = now / 1000;
     doc["cars_entered"] = state.carsEntered;
+    doc["cars_denied"] = state.carsDenied;
     doc["last_entry_ago_s"] = state.everEntered ? (int32_t)((now - state.lastEntryMs) / 1000) : -1;
     doc["time_synced"] = state.timeSynced;
-    doc["cam_last_seen_ms"] = state.haveCamData ? (int32_t)(now - state.lastCamMsgMs) : -1;
     doc["event_seq"] = eventSeq;
     if (ticketCount) {
       const Ticket &t = tickets[(ticketCount - 1) % TICKET_CAP];
@@ -695,94 +722,6 @@ static void handleHistory(AsyncWebServerRequest *req) {
     }
   }
   sendJson(req, doc, 200);
-}
-
-// roi[] lives in a packed struct at an odd offset: index it through the struct
-// (byte-wise loads) and never take a uint16_t* to it, or Xtensa faults on the unaligned load.
-static void addRoi(JsonObject o, const char *id, const config_msg_t &c, uint8_t idx) {
-  o["id"] = id;
-  o["x"] = (uint16_t)c.roi[idx][0];
-  o["y"] = (uint16_t)c.roi[idx][1];
-  o["w"] = (uint16_t)c.roi[idx][2];
-  o["h"] = (uint16_t)c.roi[idx][3];
-}
-
-static void handleConfig(AsyncWebServerRequest *req) {
-  JsonDocument doc;
-  doc["firmware_version"] = FIRMWARE_VERSION;
-  doc["ap_ssid"] = AP_SSID;
-  doc["ap_password"] = AP_PASS;
-  doc["ap_ip"] = WiFi.softAPIP().toString();
-  doc["ap_channel"] = AP_CHANNEL;
-  doc["ap_clients"] = WiFi.softAPgetStationNum();
-  doc["cam_stream_url"] = CAM_STREAM_URL;
-  doc["zone"] = String(ZONE_ID);
-  doc["total_slots"] = NUM_SLOTS;
-  doc["fee_per_hour"] = FEE_PER_HOUR;
-  doc["fee_minimum"] = FEE_MINIMUM;
-  doc["currency"] = FEE_CURRENCY;
-  {
-    Lock l;
-    const config_msg_t &c = state.camConfig;
-    bool have = state.haveCamConfig;
-    doc["cam_config_received"] = have;
-    doc["pix_thresh"] = have ? c.pix_thresh : 35;
-    doc["t_high"] = have ? c.t_high_pct / 100.0f : 0.30f;
-    doc["t_low"] = have ? c.t_low_pct / 100.0f : 0.15f;
-    doc["calibrated"] = have && c.calibrated;
-    doc["calib_count"] = have ? c.calib_count : 0;
-    JsonArray rois = doc["rois"].to<JsonArray>();
-    char id[4];
-    for (uint8_t i = 0; have && i < NUM_SLOTS; i++) {
-      slotId(i, id);
-      addRoi(rois.add<JsonObject>(), id, c, i);
-    }
-    addRoi(doc["ref_patch"].to<JsonObject>(), "REF", c, NUM_SLOTS);  // all zero until the camera reports
-  }
-  sendJson(req, doc, 200);
-}
-
-static void handleCalibrate(AsyncWebServerRequest *req) {
-  bool online;
-  {
-    Lock l;
-    online = camOnlineLocked(millis());
-  }
-  if (!online) return sendError(req, 503, "Camera offline");
-  queueCommand(CMD_CALIBRATE, 0, 0, 0);
-  Serial.println("[API] calibrate -> camera");
-  sendOk(req);
-}
-
-static void handleSettings(AsyncWebServerRequest *req) {
-  const char *body = (const char *)req->_tempObject;
-  if (!body) return sendError(req, 400, "Missing JSON body");
-
-  JsonDocument in;
-  if (deserializeJson(in, body)) return sendError(req, 400, "Invalid JSON");
-
-  int pix = in["pix_thresh"] | -1;
-  float tHigh = in["t_high"] | -1.0f;
-  float tLow = in["t_low"] | -1.0f;
-  if (pix < 10 || pix > 80) return sendError(req, 400, "pix_thresh must be 10-80");
-  if (tHigh < 0.10f || tHigh > 0.60f) return sendError(req, 400, "t_high must be 0.10-0.60");
-  if (tLow < 0.05f || tLow > 0.40f) return sendError(req, 400, "t_low must be 0.05-0.40");
-  if (tLow >= tHigh) return sendError(req, 400, "t_low must be lower than t_high");
-
-  bool online;
-  {
-    Lock l;
-    online = camOnlineLocked(millis());
-  }
-  if (!online) return sendError(req, 503, "Camera offline");
-
-  queueCommand(CMD_SETTINGS, (uint8_t)pix, (uint8_t)lroundf(tHigh * 100), (uint8_t)lroundf(tLow * 100));
-  {
-    Lock l;
-    logEventLocked(EV_SETTINGS, -1, (uint16_t)pix);
-  }
-  Serial.printf("[API] settings -> camera: pix=%d high=%.2f low=%.2f\n", pix, tHigh, tLow);
-  sendOk(req);
 }
 
 // GET /api/events?since=<seq> -> events newer than seq (oldest first)
@@ -871,6 +810,43 @@ static void handleTicket(AsyncWebServerRequest *req) {
   sendJson(req, doc, 200);
 }
 
+// POST /api/gate {"mode":"auto"|"open"|"closed"}
+static void handleGate(AsyncWebServerRequest *req) {
+  const char *body = (const char *)req->_tempObject;
+  if (!body) return sendError(req, 400, "Missing JSON body");
+  JsonDocument in;
+  if (deserializeJson(in, body)) return sendError(req, 400, "Invalid JSON");
+  const char *mode = in["mode"] | "";
+  int8_t m = -1;
+  for (uint8_t i = 0; i < 3; i++)
+    if (!strcmp(mode, GATE_MODE_NAMES[i])) m = i;
+  if (m < 0) return sendError(req, 400, "mode must be auto, open or closed");
+  {
+    Lock l;
+    requestedMode = m;
+  }
+  JsonDocument doc;
+  doc["ok"] = true;
+  doc["mode"] = GATE_MODE_NAMES[m];
+  sendJson(req, doc, 200);
+}
+
+// POST /api/buzzer {"pattern":"beep"|"double"|"long"}
+static void handleBuzzer(AsyncWebServerRequest *req) {
+  const char *body = (const char *)req->_tempObject;
+  const char *pattern = "beep";
+  JsonDocument in;
+  if (body && !deserializeJson(in, body)) pattern = in["pattern"] | "beep";
+  const uint8_t *p = !strcmp(pattern, "double") ? BEEP_DOUBLE : !strcmp(pattern, "long") ? BEEP_LONG : BEEP_SHORT;
+  {
+    Lock l;
+    requestedBeep = p;
+  }
+  JsonDocument doc;
+  doc["ok"] = true;
+  sendJson(req, doc, 200);
+}
+
 static void handleTime(AsyncWebServerRequest *req) {
   const char *body = (const char *)req->_tempObject;
   if (!body) return sendError(req, 400, "Missing JSON body");
@@ -885,77 +861,96 @@ static void handleTime(AsyncWebServerRequest *req) {
     Lock l;
     state.timeSynced = true;
   }
-  Serial.printf("[API] clock set to %lu\n", (unsigned long)epoch);
-  sendOk(req);
+  JsonDocument doc;
+  doc["ok"] = true;
+  sendJson(req, doc, 200);
 }
 
-static const char FALLBACK_HTML[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Smart Parking</title>
-<style>body{background:#0D0D0D;color:#fff;font-family:system-ui,sans-serif;padding:24px}
-code{color:#39FF14}a{color:#39FF14}</style></head><body>
-<h2>Smart Parking controller is running</h2>
-<p>The dashboard has not been uploaded to SPIFFS yet. Run <code>scripts/upload_dashboard.sh</code>.</p>
-<p>API: <a href="/api/status">/api/status</a> &middot; <a href="/api/history">/api/history</a>
-&middot; <a href="/api/config">/api/config</a></p></body></html>)HTML";
-
-static void handleIndex(AsyncWebServerRequest *req) {
-  // index.html is never cached so a new upload is picked up immediately;
-  // the hashed JS/CSS files are cached by serveStatic below.
-  if (SPIFFS.exists("/index.html.gz") || SPIFFS.exists("/index.html")) {
-    AsyncWebServerResponse *res = req->beginResponse(SPIFFS, "/index.html", "text/html");
-    res->addHeader("Cache-Control", "no-cache");
-    req->send(res);
-  } else {
-    req->send(200, "text/html", FALLBACK_HTML);
-  }
+static void handleRoot(AsyncWebServerRequest *req) {
+  String ip = WiFi.localIP().toString();
+  String html = "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+                "<body style='background:#0D0D0D;color:#fff;font-family:system-ui;padding:24px'>"
+                "<h3>Smart Parking &middot; controller node</h3><p>Add <code>" + ip +
+                "</code> as a <b>controller</b> node in the dashboard.</p>"
+                "<p><a style='color:#39FF14' href='/api/status'>/api/status</a></p></body>";
+  req->send(200, "text/html", html);
 }
 
 static void setupServer() {
+  // CORS + Private-Network headers let a dashboard hosted anywhere (laptop, Vercel) call this node
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "Content-Type");
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Private-Network", "true");
 
+  server.on("/", HTTP_GET, handleRoot);
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/history", HTTP_GET, handleHistory);
-  server.on("/api/config", HTTP_GET, handleConfig);
-  server.on("/api/calibrate", HTTP_POST, handleCalibrate, nullptr, collectBody);
-  server.on("/api/settings", HTTP_POST, handleSettings, nullptr, collectBody);
-  server.on("/api/time", HTTP_POST, handleTime, nullptr, collectBody);
   server.on("/api/events", HTTP_GET, handleEvents);
   server.on("/api/tickets", HTTP_GET, handleTickets);
   server.on("/api/ticket", HTTP_GET, handleTicket);
-
-  server.on("/", HTTP_GET, handleIndex);
-  server.on("/index.html", HTTP_GET, handleIndex);
-  // Files are uploaded gzipped (app.js.gz); the server sends them with Content-Encoding: gzip
-  server.serveStatic("/", SPIFFS, "/").setCacheControl("max-age=31536000");
+  server.on("/api/gate", HTTP_POST, handleGate, nullptr, collectBody);
+  server.on("/api/buzzer", HTTP_POST, handleBuzzer, nullptr, collectBody);
+  server.on("/api/time", HTTP_POST, handleTime, nullptr, collectBody);
 
   server.onNotFound([](AsyncWebServerRequest *req) {
-    if (req->method() == HTTP_OPTIONS) {
-      req->send(204);  // CORS preflight; headers come from DefaultHeaders
-    } else {
-      sendError(req, 404, "Not found");
-    }
+    if (req->method() == HTTP_OPTIONS) req->send(204);  // CORS preflight; headers come from DefaultHeaders
+    else sendError(req, 404, "Not found");
   });
-
   server.begin();
+}
+
+// ───────────────────────────── Wi-Fi ───────────────────────────────
+static void setupWifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(NODE_NAME);
+  WiFi.setSleep(false);  // power save drops ESP-NOW packets
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("[WiFi] joining \"%s\" (MAC %s)\n", WIFI_SSID, WiFi.macAddress().c_str());
+}
+
+// Prints the address to type into the dashboard once the hotspot gives us one
+static void checkWifi() {
+  static bool wasConnected = false;
+  bool connected = WiFi.status() == WL_CONNECTED;
+  if (connected && !wasConnected) {
+    String ip = WiFi.localIP().toString();
+    Serial.println("\n==============================================");
+    Serial.printf("  CONTROLLER NODE ONLINE  ->  http://%s\n", ip.c_str());
+    Serial.printf("  Wi-Fi channel %d, signal %d dBm\n", WiFi.channel(), WiFi.RSSI());
+    Serial.println("  Add this IP as a CONTROLLER node in the dashboard");
+    Serial.println("==============================================\n");
+    if (MDNS.begin(NODE_NAME)) MDNS.addService("http", "tcp", 80);
+  } else if (!connected && wasConnected) {
+    Serial.println("[WiFi] disconnected, reconnecting...");
+  }
+  wasConnected = connected;
 }
 
 // ───────────────────────────── Setup / loop ────────────────────────
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.printf("\n=== Smart Parking controller v%s ===\n", FIRMWARE_VERSION);
+  Serial.printf("\n=== Smart Parking controller node v%s ===\n", FIRMWARE_VERSION);
 
   stateMutex = xSemaphoreCreateMutex();
   memset(&state, 0, sizeof(state));
+  state.gateMode = GATE_AUTO;
 
   for (uint8_t i = 0; i < NUM_SLOTS; i++) {
-    pinMode(LED_GREEN[i], OUTPUT);
-    pinMode(LED_RED[i], OUTPUT);
-    digitalWrite(LED_GREEN[i], LOW);
-    digitalWrite(LED_RED[i], LOW);
+    pinMode(SLOT_LED[i], OUTPUT);
+    digitalWrite(SLOT_LED[i], LOW);
   }
+  pinMode(PIN_LED_PASS, OUTPUT);
+  pinMode(PIN_LED_STOP, OUTPUT);
+#if LED_LOW_DRIVE
+  for (uint8_t i = 0; i < NUM_SLOTS; i++) gpio_set_drive_capability((gpio_num_t)SLOT_LED[i], GPIO_DRIVE_CAP_0);
+  gpio_set_drive_capability((gpio_num_t)PIN_LED_PASS, GPIO_DRIVE_CAP_0);
+  gpio_set_drive_capability((gpio_num_t)PIN_LED_STOP, GPIO_DRIVE_CAP_0);
+#endif
+  digitalWrite(PIN_LED_PASS, LOW);
+  digitalWrite(PIN_LED_STOP, HIGH);
   pinMode(PIN_IR, INPUT_PULLUP);
 
   Wire.begin(PIN_OLED_SDA, PIN_OLED_SCL);
@@ -972,24 +967,23 @@ void setup() {
   }
 
   ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
   gateServo.setPeriodHertz(50);
   gateServo.attach(PIN_SERVO, 500, 2400);
   gateServo.write(SERVO_CLOSED_DEG);
 
-  if (!SPIFFS.begin(true)) Serial.println("[SPIFFS] mount failed, dashboard unavailable");
-  else Serial.printf("[SPIFFS] %u / %u bytes used\n", (unsigned)SPIFFS.usedBytes(), (unsigned)SPIFFS.totalBytes());
+#if BUZZER_TONE
+  buzzerPwm.attachPin(PIN_BUZZER, BUZZER_FREQ, 10);
+  buzzerPwm.writeScaled(0.0f);
+#else
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
+#endif
 
-  WiFi.mode(WIFI_AP);
-  WiFi.softAPConfig(AP_IP, AP_IP, AP_MASK);
-  WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, 0, AP_MAX_CLIENTS);
-  WiFi.setSleep(false);  // keeps ESP-NOW reception reliable
-  delay(100);
-  Serial.printf("[WiFi] AP \"%s\" on channel %u, IP %s, MAC %s\n", AP_SSID, AP_CHANNEL,
-                WiFi.softAPIP().toString().c_str(), WiFi.softAPmacAddress().c_str());
-
+  setupWifi();
   setupEspNow();
   setupServer();
-  Serial.println("[HTTP] dashboard at http://192.168.4.1/");
+  beep(BEEP_BOOT);
 }
 
 void loop() {
@@ -997,22 +991,26 @@ void loop() {
   static uint32_t lastDisplayMs = 0;
   uint32_t now = millis();
 
+  checkWifi();
   processEspNow(now);
 
   bool online;
+  const uint8_t *beepReq;
   {
     Lock l;
     online = camOnlineLocked(now);
+    beepReq = requestedBeep;
+    requestedBeep = nullptr;
+    if (online != wasOnline) logEventLocked(online ? EV_CAM_ONLINE : EV_CAM_OFFLINE, -1, 0);
   }
   if (online != wasOnline) {
     Serial.printf("[CAM] %s\n", online ? "online" : "OFFLINE (no ESP-NOW for 3 s)");
     wasOnline = online;
-    Lock l;
-    logEventLocked(online ? EV_CAM_ONLINE : EV_CAM_OFFLINE, -1, 0);
   }
+  if (beepReq) beep(beepReq);
 
   updateGate(now);
-  serviceCommands(now);
+  updateBuzzer(now);
   updateLeds(now);
 
   if (now - lastDisplayMs >= DISPLAY_INTERVAL_MS) {

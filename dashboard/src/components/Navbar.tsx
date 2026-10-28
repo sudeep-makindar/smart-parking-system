@@ -10,8 +10,8 @@ const tabs = [
 ];
 
 interface Props {
-  isConnected: boolean;
-  error: string | null;
+  camera: boolean;
+  controller: boolean;
   demo: boolean;
 }
 
@@ -24,7 +24,7 @@ function Logo() {
   );
 }
 
-export default function Navbar({ isConnected, error, demo }: Props) {
+export default function Navbar({ camera, controller, demo }: Props) {
   return (
     <header className="sticky top-0 z-40 border-b border-border bg-bg-primary/90 backdrop-blur">
       <div className="mx-auto flex h-14 max-w-6xl items-center gap-8 px-4 sm:px-6">
@@ -48,7 +48,7 @@ export default function Navbar({ isConnected, error, demo }: Props) {
           >
             Entrance sign ↗
           </Link>
-          <ConnectionStatus isConnected={isConnected} error={error} />
+          <ConnectionStatus camera={camera} controller={controller} />
           <span className="hidden sm:block">
             <LiveClock />
           </span>

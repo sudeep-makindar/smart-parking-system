@@ -2,14 +2,16 @@ import { useEffect, useState } from "react";
 import { getTickets } from "../api/parking";
 import type { TicketsResponse } from "../types/parking";
 
-export function useTickets(intervalMs = 3000) {
+export function useTickets(host: string, intervalMs = 3000) {
   const [tickets, setTickets] = useState<TicketsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    setTickets(null);
+    if (!host) return;
     let alive = true;
     const load = () =>
-      getTickets()
+      getTickets(host)
         .then((t) => {
           if (!alive) return;
           setTickets(t);
@@ -22,7 +24,7 @@ export function useTickets(intervalMs = 3000) {
       alive = false;
       clearInterval(id);
     };
-  }, [intervalMs]);
+  }, [host, intervalMs]);
 
   return { tickets, error };
 }

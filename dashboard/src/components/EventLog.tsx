@@ -18,8 +18,7 @@ const tone: Record<string, string> = {
   ticket_closed: "bg-accent-green",
   cam_online: "bg-accent-green",
   cam_offline: "bg-danger",
-  calibrated: "bg-txt-secondary",
-  settings: "bg-txt-secondary",
+  gate_mode: "bg-txt-secondary",
 };
 
 function describe(e: TimedEvent, currency: string, fees: Record<number, number>) {
@@ -33,7 +32,7 @@ function describe(e: TimedEvent, currency: string, fees: Record<number, number>)
     case "gate_close":
       return "Gate closed";
     case "entry_denied":
-      return <span className="text-amber-300">Car turned away, lot full</span>;
+      return <span className="text-amber-300">Car refused, {e.value === 1 ? "gate held closed" : "lot full"}</span>;
     case "ticket_issued":
       return <>Ticket <b>#{e.value}</b> issued <span className="text-txt-muted">→ {e.slot ?? "—"}</span></>;
     case "ticket_closed":
@@ -44,13 +43,11 @@ function describe(e: TimedEvent, currency: string, fees: Record<number, number>)
         </>
       );
     case "cam_online":
-      return "Camera online";
+      return "Camera link up (ESP-NOW)";
     case "cam_offline":
-      return <span className="text-danger">Camera offline</span>;
-    case "calibrated":
-      return "Camera recalibrated";
-    case "settings":
-      return <>Thresholds updated <span className="text-txt-muted">· pixel {e.value}</span></>;
+      return <span className="text-danger">Camera link lost (ESP-NOW)</span>;
+    case "gate_mode":
+      return <>Gate set to <b>{["Auto", "Open", "Closed"][e.value] ?? "?"}</b> from the dashboard</>;
   }
 }
 
